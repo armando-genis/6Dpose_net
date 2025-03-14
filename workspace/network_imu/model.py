@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from efficientnet_pytorch import EfficientNet
 from torchvision.models.feature_extraction import create_feature_extractor
+import numpy as np
 
 MOMENTUM = 0.997
 EPSILON = 1e-4
@@ -425,8 +426,172 @@ def build_BiFPN(backbone_feature_maps, bifpn_depth, bifpn_width, freeze_bn, mome
     return fpn_feature_maps
 
 
+##########################################
+# BoxNet
+##########################################
 
+class BoxNet(nn.Module):
+    def __init__(self, width, depth, num_anchors=9, freeze_bn=False, name="box_net"):
+        super(BoxNet, self).__init__()
+        self.width = width
+        self.depth = depth
+        self.num_anchors = num_anchors
+        self.num_values = 4  # Bounding box coordinates (x, y, w, h)
+        self.name = name
 
+        # Create separable convolution layers
+        self.convs = nn.ModuleList([
+            SeparableConvBlock(num_channels=self.width, kernel_size=3, strides=1, freeze_bn=freeze_bn)
+            for _ in range(self.depth)
+        ])
+        
+        # Custom head implementation instead of using SeparableConvBlock
+        # This creates a depthwise + pointwise convolution with the correct output channels
+        self.head_depthwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.width,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.width,
+            bias=True
+        )
+        
+        self.head_pointwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.num_anchors * self.num_values,
+            kernel_size=1,
+            bias=True
+        )
+        
+        # Batch normalization layers per level (P3-P7)
+        self.bns = nn.ModuleList([
+            nn.ModuleList([
+                BatchNormalization(self.width, freeze=freeze_bn) for _ in range(5)  # Levels P3-P7
+            ])
+            for _ in range(self.depth)
+        ])
+        
+        self.activation = nn.SiLU()  # Equivalent to TensorFlow's Swish activation
+        self.level = 0
+
+    def forward(self, feature, level):
+        for i in range(self.depth):
+            feature = self.convs[i](feature)
+            feature = self.bns[i][level](feature)  # Select batch norm based on pyramid level
+            feature = self.activation(feature)
+
+        # Apply custom head (depthwise + pointwise convolution)
+        outputs = self.head_depthwise(feature)
+        outputs = self.head_pointwise(outputs)
+
+        # Reshape output to match the expected format: (batch_size, -1, num_values)
+        outputs = outputs.permute(0, 2, 3, 1).contiguous()  # (B, H, W, num_anchors * 4)
+        outputs = outputs.view(outputs.shape[0], -1, self.num_values)  # (B, num_boxes, 4)
+
+        self.level += 1  # Track the level
+        return outputs
+    
+
+##########################################
+# ClassNet
+##########################################
+
+class ClassNet(nn.Module):
+    def __init__(self, width, depth, num_classes=8, num_anchors=9, freeze_bn=False, name="class_net"):
+        super(ClassNet, self).__init__()
+        self.width = width
+        self.depth = depth
+        self.num_classes = num_classes
+        self.num_anchors = num_anchors
+        self.name = name
+
+        # Create separable convolution layers
+        self.convs = nn.ModuleList([
+            SeparableConvBlock(num_channels=self.width, kernel_size=3, strides=1, freeze_bn=freeze_bn)
+            for _ in range(self.depth)
+        ])
+        
+        # Prediction head - custom implementation to handle different output channels
+        self.head_depthwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.width,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.width,
+            bias=True
+        )
+        
+        # Prior probability initialization for bias (equivalent to TensorFlow's PriorProbability)
+        # Setting a negative bias to achieve ~0.01 probability after sigmoid
+        bias_value = -np.log((1 - 0.01) / 0.01)
+        self.head_pointwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.num_anchors * self.num_classes,
+            kernel_size=1,
+            bias=True
+        )
+        # Initialize bias to achieve desired prior probability
+        nn.init.constant_(self.head_pointwise.bias, bias_value)
+        
+        # Batch normalization layers per level (P3-P7)
+        self.bns = nn.ModuleList([
+            nn.ModuleList([
+                BatchNormalization(self.width, freeze=freeze_bn) for _ in range(5)  # Levels P3-P7
+            ])
+            for _ in range(self.depth)
+        ])
+        
+        self.activation = nn.SiLU()  # Equivalent to TensorFlow's Swish activation
+        self.activation_sigmoid = nn.Sigmoid()  # Final sigmoid activation
+        self.level = 0
+
+    def forward(self, feature, level):
+        for i in range(self.depth):
+            feature = self.convs[i](feature)
+            feature = self.bns[i][level](feature)  # Select batch norm based on pyramid level
+            feature = self.activation(feature)
+
+        # Apply custom head (depthwise + pointwise convolution)
+        outputs = self.head_depthwise(feature)
+        outputs = self.head_pointwise(outputs)
+
+        # Reshape output to match the expected format: (batch_size, -1, num_classes)
+        outputs = outputs.permute(0, 2, 3, 1).contiguous()  # (B, H, W, num_anchors * num_classes)
+        outputs = outputs.view(outputs.shape[0], -1, self.num_classes)  # (B, num_boxes, num_classes)
+        
+        # Apply sigmoid activation for classification
+        outputs = self.activation_sigmoid(outputs)
+
+        self.level += 1  # Track the level
+        return outputs
+
+##########################################
+# subnet build 
+##########################################
+
+def build_subnets(num_classes, subnet_width, subnet_depth, subnet_num_iteration_steps, num_groups_gn, num_rotation_parameters, freeze_bn, num_anchors):
+    # Instantiate BoxNet
+    box_net = BoxNet(
+        width=subnet_width,
+        depth=subnet_depth,
+        num_anchors=num_anchors,
+        freeze_bn=freeze_bn,
+        name = 'box_net'
+    )
+
+    # Instantiate ClassNet
+    class_net = ClassNet(
+        width=subnet_width,
+        depth=subnet_depth,
+        num_classes=num_classes,
+        num_anchors=num_anchors,
+        freeze_bn=freeze_bn,
+        name = 'class_net'
+    )
+
+    return box_net, class_net
 
     
 class BuildEfficientPoseModel(nn.Module):
@@ -506,7 +671,21 @@ class BuildEfficientPoseModel(nn.Module):
             freeze_bn=self.freeze_bn
         )
 
-        return fpn_feature_maps
+        # ✅ Build subnets
+        box_net, class_net = build_subnets(
+            num_classes=self.num_classes,
+            subnet_width=self.bifpn_width,
+            subnet_depth=self.subnet_depth,
+            subnet_num_iteration_steps=self.subnet_num_iteration_steps,
+            num_groups_gn=self.num_groups_gn,
+            num_rotation_parameters=self.num_rotation_parameters,
+            freeze_bn=self.freeze_bn,
+            num_anchors=self.num_anchors
+        )
+
+
+
+        return fpn_feature_maps, box_net, class_net
 
 
 
@@ -573,6 +752,60 @@ def count_parameters(model):
     return total_params, trainable_params, non_trainable_params
 
 
+# Add a test function for BoxNet
+def test_boxnet():
+    print("\n===== PyTorch BoxNet Test =====")
+    
+    # Parameters (same as in TensorFlow test)
+    width = 64
+    depth = 3
+    num_anchors = 9
+    
+    # Create BoxNet instance
+
+    box_net = BoxNet(width=width, depth=depth, num_anchors=num_anchors)
+    
+    # Print network structure
+    print(f"Width: {box_net.width}")
+    print(f"Depth: {box_net.depth}")
+    print(f"Num anchors: {box_net.num_anchors}")
+    print(f"Num values: {box_net.num_values}")
+    print(f"Number of convolution layers: {len(box_net.convs)}")
+    print(f"Number of BN layers per level: {len(box_net.bns[0]) if box_net.bns else 0}")
+    
+    # Create random input (matching the TensorFlow test)
+    batch_size = 1
+    feature_size = 32
+    
+    # PyTorch uses BCHW format (TensorFlow uses BHWC)
+    feature_map = torch.randn(batch_size, width, feature_size, feature_size)
+    level = 0
+    
+    # Run inference
+    print("\nRunning inference on test feature map...")
+    output = box_net(feature_map, level)
+    
+    # Print results
+    print(f"Input shape: {feature_map.shape} (BCHW format)")
+    print(f"Output shape: {output.shape}")
+    print(f"Expected output shape: torch.Size([{batch_size}, {feature_size * feature_size * num_anchors}, 4])")
+    
+    # Verify shape
+    expected_shape = (batch_size, feature_size * feature_size * num_anchors, 4)
+    if output.shape == expected_shape:
+        print("✓ Output shape is correct!")
+    else:
+        print("✗ Output shape does not match expected shape!")
+    
+    # Print first few values
+    print("\nFirst 3 output values:")
+    print(output[0, :3, :].detach().numpy())
+    
+    # Additional check: is level incremented?
+    print(f"\nLevel after forward pass: {box_net.level} (should be 1)")
+    
+    return output
+
 # add main function to test the function
 if __name__ == "__main__":
     # # Test the function
@@ -625,16 +858,57 @@ if __name__ == "__main__":
     # print(f"Prediction shape: {predictions.shape}")
 
     # build_EfficientPose
-    phi = 3  # Select EfficientNet-B2
+    phi = 1  # Select EfficientNet-B2
     model = BuildEfficientPoseModel(phi)
 
     # Create dummy input
     dummy_input = torch.randn(1, 3, model.input_size, model.input_size)
 
     # Get feature maps
-    feature_maps = model(dummy_input)
+    feature_maps, box_net = model(dummy_input)
 
+    
     # Print feature maps in TensorFlow-like format
     print("\nBiFPN feature maps shape:")
     for i, fm in enumerate(feature_maps):
         print(f"Tensor(\"FPN{i+1}\", shape={tuple(fm.shape)}, dtype=float32)")
+
+
+    print("\n===== PyTorch BoxNet Test =====")
+
+    # Print network structure
+    print(f"Width: {box_net.width}")
+    print(f"Depth: {box_net.depth}")
+    print(f"Num anchors: {box_net.num_anchors}")
+    print(f"Num values: {box_net.num_values}")
+    print(f"Number of convolution layers: {len(box_net.convs)}")
+    print(f"Number of BN layers per level: {len(box_net.bns[0]) if box_net.bns else 0}")
+
+    # Create random input (matching the TensorFlow test)
+    batch_size = 1
+    feature_size = 32
+    
+    # PyTorch uses BCHW format (TensorFlow uses BHWC)
+    feature_map = torch.randn(batch_size, model.bifpn_width, feature_size, feature_size)
+    level = 0
+
+
+    # Run inference
+    print("\nRunning inference on test feature map...")
+    output = box_net(feature_map, level)
+
+    # Print results
+    print(f"Input shape: {feature_map.shape} (BCHW format)")
+    print(f"Output shape: {output.shape}")
+    print(f"Expected output shape: torch.Size([{batch_size}, {feature_size * feature_size * model.num_anchors}, 4])")
+    
+    # Verify shape
+    expected_shape = (batch_size, feature_size * feature_size * model.num_anchors, 4)
+    if output.shape == expected_shape:
+        print("✓ Output shape is correct!")
+    else:
+        print("✗ Output shape does not match expected shape!")
+    
+    # Print first few values
+    print("\nFirst 3 output values:")
+    print(output[0, :3, :].detach().numpy())
