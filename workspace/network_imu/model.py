@@ -2,6 +2,8 @@ import torchvision.models as models
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from efficientnet_pytorch import EfficientNet
+from torchvision.models.feature_extraction import create_feature_extractor
 
 MOMENTUM = 0.997
 EPSILON = 1e-4
@@ -424,6 +426,8 @@ def build_BiFPN(backbone_feature_maps, bifpn_depth, bifpn_width, freeze_bn, mome
 
 
 
+
+
     
 class BuildEfficientPoseModel(nn.Module):
     def __init__(self, phi, num_classes=8, num_anchors=9, freeze_bn=False, score_threshold=0.5, anchor_parameters=None, num_rotation_parameters=3, print_architecture=True):
@@ -432,33 +436,77 @@ class BuildEfficientPoseModel(nn.Module):
         # Select parameters according to the given phi
         assert phi in range(7)
         scaled_parameters = get_scaled_parameters(phi)
-
-        input_size = scaled_parameters["input_size"]
-        input_shape = (3, input_size, input_size)
-        bifpn_width = subnet_width = scaled_parameters["bifpn_width"]
-        bifpn_depth = scaled_parameters["bifpn_depth"]
-        subnet_depth = scaled_parameters["subnet_depth"]
-        subnet_num_iteration_steps = scaled_parameters["subnet_num_iteration_steps"]
-        num_groups_gn = scaled_parameters["num_groups_gn"]
-        backbone_class = scaled_parameters["backbone_class"]
+        self.phi = phi
+        self.input_size = scaled_parameters["input_size"] 
+        self.input_shape = (3, self.input_size, self.input_size)
+        self.bifpn_width = scaled_parameters["bifpn_width"]
+        self.bifpn_depth = scaled_parameters["bifpn_depth"]
+        self.subnet_depth = scaled_parameters["subnet_depth"]
+        self.subnet_num_iteration_steps = scaled_parameters["subnet_num_iteration_steps"]
+        self.num_groups_gn = scaled_parameters["num_groups_gn"]
+        self.backbone_class = scaled_parameters["backbone_class"]
+        self.freeze_bn = freeze_bn
+        self.num_classes = num_classes
+        self.num_anchors = num_anchors
+        self.num_rotation_parameters = num_rotation_parameters
+        self.score_threshold = score_threshold
         
-        # Input layers
-        self.image_input = nn.Parameter(torch.Tensor(*input_shape))
-        self.camera_parameters_input = nn.Parameter(torch.Tensor(6))
+        self.feature_extractor = self._build_backbone()
 
-        # Build EfficientNet backbone
-        self.backbone_feature_maps = backbone_class(input_tensor=self.image_input, freeze_bn=freeze_bn)
-        if print_architecture:
-            print("Backbone feature maps:", self.backbone_feature_maps)
+    def _build_backbone(self):
+        """Build the EfficientNet backbone"""
 
-        # Build BiFPN
-        self.fpn_feature_maps = build_BiFPN(
-            self.backbone_feature_maps,
-            bifpn_depth=bifpn_depth,
-            bifpn_width=bifpn_width,
-            freeze_bn=freeze_bn
+        if self.phi == 0:
+            from torchvision.models import EfficientNet_B0_Weights
+            backbone = models.efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+        elif self.phi == 1:
+            from torchvision.models import EfficientNet_B1_Weights
+            backbone = models.efficientnet_b1(weights=EfficientNet_B1_Weights.IMAGENET1K_V1)
+        elif self.phi == 2:
+            from torchvision.models import EfficientNet_B2_Weights
+            backbone = models.efficientnet_b2(weights=EfficientNet_B2_Weights.IMAGENET1K_V1)
+        elif self.phi == 3:
+            from torchvision.models import EfficientNet_B3_Weights
+            backbone = models.efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+        elif self.phi == 4:
+            from torchvision.models import EfficientNet_B4_Weights
+            backbone = models.efficientnet_b4(weights=EfficientNet_B4_Weights.IMAGENET1K_V1)
+        elif self.phi == 5:
+            from torchvision.models import EfficientNet_B5_Weights
+            backbone = models.efficientnet_b5(weights=EfficientNet_B5_Weights.IMAGENET1K_V1)
+        elif self.phi == 6:
+            from torchvision.models import EfficientNet_B6_Weights
+            backbone = models.efficientnet_b6(weights=EfficientNet_B6_Weights.IMAGENET1K_V1)
+
+        # Corrected layer names for feature extraction based on your printed architecture
+        self.return_nodes = {
+            "features.1": "C1",  # Low-level features
+            "features.2": "C2",  # Mid-level features
+            "features.3": "C3",  # Higher-level features
+            "features.5": "C4",  # Deep features
+            "features.7": "C5"   # Final feature map
+        }
+
+        # Create the feature extractor with the corrected layers
+        feature_extractor = create_feature_extractor(backbone, return_nodes=self.return_nodes)
+        return feature_extractor
+
+
+
+    def forward(self, x):
+        """Returns feature maps in TensorFlow-like order"""
+        features = self.feature_extractor(x)  # Extract features as a dictionary
+        backbone_feature_maps = [features[node_name] for node_name in ["C1", "C2", "C3", "C4", "C5"]]
+
+        # ✅ Build BiFPN
+        fpn_feature_maps = build_BiFPN(
+            backbone_feature_maps,
+            bifpn_depth=self.bifpn_depth,
+            bifpn_width=self.bifpn_width,
+            freeze_bn=self.freeze_bn
         )
 
+        return fpn_feature_maps
 
 
 
@@ -527,55 +575,66 @@ def count_parameters(model):
 
 # add main function to test the function
 if __name__ == "__main__":
-    # Test the function
-    phi = 0
-    scaled_parameters = get_scaled_parameters(phi)
-    print(scaled_parameters)
-    # Expected output: {'input_size': 512, 'bifpn_width': 64, 'bifpn_depth': 3, 'subnet_depth': 3, 'subnet_num_iteration_steps': 1, 'num_groups_gn': 4, 'backbone_class': <function efficientnet_b0 at 0x7f8c6b5e8d30>}
+    # # Test the function
+    # phi = 0
+    # scaled_parameters = get_scaled_parameters(phi)
+    # print(scaled_parameters)
+    # # Expected output: {'input_size': 512, 'bifpn_width': 64, 'bifpn_depth': 3, 'subnet_depth': 3, 'subnet_num_iteration_steps': 1, 'num_groups_gn': 4, 'backbone_class': <function efficientnet_b0 at 0x7f8c6b5e8d30>}
 
 
-    # Create dummy backbone feature maps with realistic shapes
-    batch_size = 2
-    C1 = torch.randn(batch_size, 32, 128, 128)
-    C2 = torch.randn(batch_size, 64, 64, 64)
-    C3 = torch.randn(batch_size, 128, 32, 32)
-    C4 = torch.randn(batch_size, 256, 16, 16)
-    C5 = torch.randn(batch_size, 512, 8, 8)
+    # # Create dummy backbone feature maps with realistic shapes
+    # batch_size = 2
+    # C1 = torch.randn(batch_size, 32, 128, 128)
+    # C2 = torch.randn(batch_size, 64, 64, 64)
+    # C3 = torch.randn(batch_size, 128, 32, 32)
+    # C4 = torch.randn(batch_size, 256, 16, 16)
+    # C5 = torch.randn(batch_size, 512, 8, 8)
 
-    # Gather backbone features
-    backbone_features = [C1, C2, C3, C4, C5]
+    # # Gather backbone features
+    # backbone_features = [C1, C2, C3, C4, C5]
 
-    # Set BiFPN parameters
-    num_channels = 160
-    freeze_bn = True
+    # # Set BiFPN parameters
+    # num_channels = 160
+    # freeze_bn = True
 
-    # Build the first BiFPN layer
-    P3, P4, P5, P6, P7 = build_BiFPN_layer(
-        backbone_features, 
-        num_channels=num_channels, 
-        idx_BiFPN_layer=0, 
-        freeze_bn=freeze_bn
-    )
+    # # Build the first BiFPN layer
+    # P3, P4, P5, P6, P7 = build_BiFPN_layer(
+    #     backbone_features, 
+    #     num_channels=num_channels, 
+    #     idx_BiFPN_layer=0, 
+    #     freeze_bn=freeze_bn
+    # )
 
-    # Print output shapes
-    print("BiFPN Output Feature Maps:")
-    print(f"P3 shape: {P3.shape}")  # Should be [batch_size, num_channels, 32, 32]
-    print(f"P4 shape: {P4.shape}")  # Should be [batch_size, num_channels, 16, 16]
-    print(f"P5 shape: {P5.shape}")  # Should be [batch_size, num_channels, 8, 8]
-    print(f"P6 shape: {P6.shape}")  # Should be [batch_size, num_channels, 4, 4]
-    print(f"P7 shape: {P7.shape}")  # Should be [batch_size, num_channels, 2, 2]
+    # # Print output shapes
+    # print("BiFPN Output Feature Maps:")
+    # print(f"P3 shape: {P3.shape}")  # Should be [batch_size, num_channels, 32, 32]
+    # print(f"P4 shape: {P4.shape}")  # Should be [batch_size, num_channels, 16, 16]
+    # print(f"P5 shape: {P5.shape}")  # Should be [batch_size, num_channels, 8, 8]
+    # print(f"P6 shape: {P6.shape}")  # Should be [batch_size, num_channels, 4, 4]
+    # print(f"P7 shape: {P7.shape}")  # Should be [batch_size, num_channels, 2, 2]
 
-    # Create model
-    model = EfficientPoseModel(input_size=512)
-    print(model)
+    # # Create model
+    # model = EfficientPoseModel(input_size=512)
+    # print(model)
 
-    count_parameters(model)
+    # count_parameters(model)
 
-    # Test inference with a dummy image
-    dummy_input = torch.rand(1, 3, 512, 512)
-    predictions = model(dummy_input)
-    print(f"Prediction shape: {predictions.shape}")
+    # # Test inference with a dummy image
+    # dummy_input = torch.rand(1, 3, 512, 512)
+    # predictions = model(dummy_input)
+    # print(f"Prediction shape: {predictions.shape}")
 
     # build_EfficientPose
-    model = BuildEfficientPoseModel(phi=0)
-    print(model)
+    phi = 3  # Select EfficientNet-B2
+    model = BuildEfficientPoseModel(phi)
+
+    # Create dummy input
+    dummy_input = torch.randn(1, 3, model.input_size, model.input_size)
+
+    # Get feature maps
+    feature_maps = model(dummy_input)
+
+    # Print feature maps in TensorFlow-like format
+    print("\nBiFPN feature maps shape:")
+    for i, fm in enumerate(feature_maps):
+        print(f"Tensor(\"FPN{i+1}\", shape={tuple(fm.shape)}, dtype=float32)")
