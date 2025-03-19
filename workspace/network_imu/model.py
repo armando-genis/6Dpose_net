@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from efficientnet_pytorch import EfficientNet
 from torchvision.models.feature_extraction import create_feature_extractor
 import numpy as np
+from anchor import anchors_for_shape
+from layer import FilterDetections
 
 MOMENTUM = 0.997
 EPSILON = 1e-4
@@ -99,6 +101,10 @@ class BatchNormalization(nn.BatchNorm2d):
         else:
             return super().forward(input)
         
+
+##########################################
+# SeparableConvBlock
+##########################################
 class SeparableConvBlock(nn.Module):
     """
     Builds a block with a depthwise separable convolution layer followed by a batch norm layer.
@@ -121,6 +127,8 @@ class SeparableConvBlock(nn.Module):
         x = self.pointwise(x)
         x = self.bn(x)
         return x
+    
+
         
 #############################################
 # Prepare backbone feature maps for BiFPN
@@ -566,6 +574,588 @@ class ClassNet(nn.Module):
 
         self.level += 1  # Track the level
         return outputs
+    
+##########################################
+# iteratively predict rotation and rotation subnet
+##########################################
+    
+class IterativeRotationSubNet(nn.Module):
+    def __init__(self, width, depth, num_values, num_iteration_steps, num_anchors=9, 
+                 freeze_bn=False, use_group_norm=True, num_groups_gn=None, name="iterative_rotation_subnet"):
+        super(IterativeRotationSubNet, self).__init__()
+        self.width = width
+        self.depth = depth
+        self.num_anchors = num_anchors
+        self.num_values = num_values
+        self.num_iteration_steps = num_iteration_steps
+        self.use_group_norm = use_group_norm
+        self.num_groups_gn = num_groups_gn
+        self.name = name
+        
+        # Concatenated input will have width + num_anchors*num_values channels
+        # First convolution should handle this expanded input
+        input_channels = self.width + self.num_anchors * self.num_values
+        
+        # First convolution layer handles the concatenated input
+        self.first_conv_depthwise = nn.Conv2d(
+            in_channels=input_channels,
+            out_channels=input_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=input_channels,
+            bias=True
+        )
+        
+        self.first_conv_pointwise = nn.Conv2d(
+            in_channels=input_channels,
+            out_channels=self.width,  # Project back to width channels
+            kernel_size=1,
+            bias=True
+        )
+        
+        # Remaining convolution layers (after the first one)
+        self.convs = nn.ModuleList([
+            SeparableConvBlock(
+                num_channels=self.width, 
+                kernel_size=3, 
+                strides=1
+            ) for _ in range(self.depth-1)  # One less because we have a separate first conv
+        ])
+        
+        # Head layer
+        self.head_depthwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.width,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.width,
+            bias=True
+        )
+        
+        self.head_pointwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.num_anchors * self.num_values,
+            kernel_size=1,
+            bias=True
+        )
+        
+        # Normalization layers
+        # Structure: [iteration_steps][depth][pyramid_levels]
+        if self.use_group_norm:
+            # First layer norm is for the output of first_conv
+            self.first_norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    GroupNormalization(num_channels=self.width, groups=self.num_groups_gn)
+                    for _ in range(5)  # 5 pyramid levels (P3-P7)
+                ])
+                for _ in range(self.num_iteration_steps)
+            ])
+            
+            # Remaining norm layers
+            self.norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    nn.ModuleList([
+                        GroupNormalization(num_channels=self.width, groups=self.num_groups_gn)
+                        for _ in range(5)  # 5 pyramid levels (P3-P7)
+                    ])
+                    for _ in range(self.depth-1)  # One less because we handle first layer separately
+                ])
+                for _ in range(self.num_iteration_steps)
+            ])
+        else:
+            # First layer norm is for the output of first_conv
+            self.first_norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    nn.BatchNorm2d(self.width, momentum=0.997, eps=1e-4)
+                    for _ in range(5)  # 5 pyramid levels (P3-P7)
+                ])
+                for _ in range(self.num_iteration_steps)
+            ])
+            
+            # Remaining norm layers
+            self.norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    nn.ModuleList([
+                        nn.BatchNorm2d(self.width, momentum=0.997, eps=1e-4)
+                        for _ in range(5)  # 5 pyramid levels (P3-P7)
+                    ])
+                    for _ in range(self.depth-1)  # One less because we handle first layer separately
+                ])
+                for _ in range(self.num_iteration_steps)
+            ])
+        
+        self.activation = nn.SiLU()  # Equivalent to TensorFlow's Swish
+        
+    def forward(self, inputs, level_py, iter_step_py):
+        feature, level = inputs
+        
+        # First conv layer that handles the concatenated input
+        feature = self.first_conv_depthwise(feature)
+        feature = self.first_conv_pointwise(feature)
+        feature = self.first_norm_layers[iter_step_py][level_py](feature)
+        feature = self.activation(feature)
+        
+        # Remaining conv layers
+        for i in range(self.depth-1):
+            feature = self.convs[i](feature)
+            feature = self.norm_layers[iter_step_py][i][level_py](feature)
+            feature = self.activation(feature)
+        
+        # Apply head
+        outputs = self.head_depthwise(feature)
+        outputs = self.head_pointwise(outputs)
+        
+        return outputs
+
+
+# RotationNet
+class RotationNet(nn.Module):
+    def __init__(self, width, depth, num_values, num_iteration_steps, num_anchors=9, 
+                 freeze_bn=False, use_group_norm=True, num_groups_gn=None, name="rotation_net"):
+        super(RotationNet, self).__init__()
+        self.width = width
+        self.depth = depth
+        self.num_anchors = num_anchors
+        self.num_values = num_values
+        self.num_iteration_steps = num_iteration_steps
+        self.use_group_norm = use_group_norm
+        self.num_groups_gn = num_groups_gn
+        self.name = name
+        
+        # Convolution layers
+        self.convs = nn.ModuleList([
+            SeparableConvBlock(
+                num_channels=self.width, 
+                kernel_size=3, 
+                strides=1
+            ) for _ in range(self.depth)
+        ])
+        
+        # Initial rotation head
+        self.initial_rotation_depthwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.width,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.width,
+            bias=True
+        )
+        
+        self.initial_rotation_pointwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.num_anchors * self.num_values,
+            kernel_size=1,
+            bias=True
+        )
+        
+        # Normalization layers
+        if self.use_group_norm:
+            self.norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    GroupNormalization(num_channels=self.width, groups=self.num_groups_gn)
+                    for _ in range(5)  # 5 pyramid levels (P3-P7)
+                ])
+                for _ in range(self.depth)
+            ])
+        else:
+            self.norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    nn.BatchNorm2d(self.width, momentum=0.997, eps=1e-4)
+                    for _ in range(5)  # 5 pyramid levels (P3-P7)
+                ])
+                for _ in range(self.depth)
+            ])
+        
+        # Iterative subnet
+        self.iterative_submodel = IterativeRotationSubNet(
+            width=self.width,
+            depth=self.depth - 1,
+            num_values=self.num_values,
+            num_iteration_steps=self.num_iteration_steps,
+            num_anchors=self.num_anchors,
+            freeze_bn=freeze_bn,
+            use_group_norm=self.use_group_norm,
+            num_groups_gn=self.num_groups_gn
+        )
+        
+        self.activation = nn.SiLU()  # Equivalent to TensorFlow's Swish
+        self.level = 0
+        
+    def forward(self, inputs):
+        feature, level = inputs
+        
+        # Apply convolutional layers with normalization
+        for i in range(self.depth):
+            feature = self.convs[i](feature)
+            feature = self.norm_layers[i][self.level](feature)
+            feature = self.activation(feature)
+        
+        # Initial rotation prediction
+        rotation = self.initial_rotation_depthwise(feature)
+        rotation = self.initial_rotation_pointwise(rotation)
+        
+        # Iterative refinement
+        for i in range(self.num_iteration_steps):
+            # Concatenate feature and current rotation along channel dimension
+            iterative_input = torch.cat([feature, rotation], dim=1)
+            
+            # Get delta rotation from iterative subnet
+            delta_rotation = self.iterative_submodel([iterative_input, level], level_py=self.level, iter_step_py=i)
+            
+            # Update rotation
+            rotation = rotation + delta_rotation
+        
+        # Reshape the output to [batch_size, -1, num_values]
+        outputs = rotation.permute(0, 2, 3, 1).contiguous()  # (B, H, W, anchors*values)
+        outputs = outputs.view(outputs.shape[0], -1, self.num_values)  # (B, num_boxes, values)
+        
+        self.level += 1
+        return outputs
+    
+
+##########################################
+# iteratively predict translation and translation subnet
+##########################################
+class IterativeTranslationSubNet(nn.Module):
+    def __init__(self, width, depth, num_iteration_steps, num_anchors=9, 
+                 freeze_bn=False, use_group_norm=True, num_groups_gn=None, name="iterative_translation_subnet"):
+        super(IterativeTranslationSubNet, self).__init__()
+        self.width = width
+        self.depth = depth
+        self.num_anchors = num_anchors
+        self.num_iteration_steps = num_iteration_steps
+        self.use_group_norm = use_group_norm
+        self.num_groups_gn = num_groups_gn
+        self.name = name
+        
+        # Concatenated input will have width + num_anchors*3 channels (2 for xy, 1 for z)
+        # First convolution should handle this expanded input
+        input_channels = self.width + self.num_anchors * 3
+        
+        # First convolution layer handles the concatenated input
+        self.first_conv_depthwise = nn.Conv2d(
+            in_channels=input_channels,
+            out_channels=input_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=input_channels,
+            bias=True
+        )
+        
+        self.first_conv_pointwise = nn.Conv2d(
+            in_channels=input_channels,
+            out_channels=self.width,  # Project back to width channels
+            kernel_size=1,
+            bias=True
+        )
+        
+        # Remaining convolution layers (after the first one)
+        self.convs = nn.ModuleList([
+            SeparableConvBlock(
+                num_channels=self.width, 
+                kernel_size=3, 
+                strides=1
+            ) for _ in range(self.depth-1)  # One less because we have a separate first conv
+        ])
+        
+        # Head layers for xy and z
+        self.head_xy_depthwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.width,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.width,
+            bias=True
+        )
+        
+        self.head_xy_pointwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.num_anchors * 2,  # x, y coordinates
+            kernel_size=1,
+            bias=True
+        )
+        
+        self.head_z_depthwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.width,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.width,
+            bias=True
+        )
+        
+        self.head_z_pointwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.num_anchors,  # z coordinate
+            kernel_size=1,
+            bias=True
+        )
+        
+        # Normalization layers
+        # Structure: [iteration_steps][depth][pyramid_levels]
+        if self.use_group_norm:
+            # First layer norm is for the output of first_conv
+            self.first_norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    GroupNormalization(num_channels=self.width, groups=self.num_groups_gn)
+                    for _ in range(5)  # 5 pyramid levels (P3-P7)
+                ])
+                for _ in range(self.num_iteration_steps)
+            ])
+            
+            # Remaining norm layers
+            self.norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    nn.ModuleList([
+                        GroupNormalization(num_channels=self.width, groups=self.num_groups_gn)
+                        for _ in range(5)  # 5 pyramid levels (P3-P7)
+                    ])
+                    for _ in range(self.depth-1)  # One less because we handle first layer separately
+                ])
+                for _ in range(self.num_iteration_steps)
+            ])
+        else:
+            # First layer norm is for the output of first_conv
+            self.first_norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    nn.BatchNorm2d(self.width, momentum=0.997, eps=1e-4)
+                    for _ in range(5)  # 5 pyramid levels (P3-P7)
+                ])
+                for _ in range(self.num_iteration_steps)
+            ])
+            
+            # Remaining norm layers
+            self.norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    nn.ModuleList([
+                        nn.BatchNorm2d(self.width, momentum=0.997, eps=1e-4)
+                        for _ in range(5)  # 5 pyramid levels (P3-P7)
+                    ])
+                    for _ in range(self.depth-1)  # One less because we handle first layer separately
+                ])
+                for _ in range(self.num_iteration_steps)
+            ])
+        
+        self.activation = nn.SiLU()  # Equivalent to TensorFlow's Swish
+        
+    def forward(self, inputs, level_py, iter_step_py):
+        feature, level = inputs
+        
+        # First conv layer that handles the concatenated input
+        feature = self.first_conv_depthwise(feature)
+        feature = self.first_conv_pointwise(feature)
+        feature = self.first_norm_layers[iter_step_py][level_py](feature)
+        feature = self.activation(feature)
+        
+        # Remaining conv layers
+        for i in range(self.depth-1):
+            feature = self.convs[i](feature)
+            feature = self.norm_layers[iter_step_py][i][level_py](feature)
+            feature = self.activation(feature)
+        
+        # Apply heads
+        outputs_xy = self.head_xy_depthwise(feature)
+        outputs_xy = self.head_xy_pointwise(outputs_xy)
+        
+        outputs_z = self.head_z_depthwise(feature)
+        outputs_z = self.head_z_pointwise(outputs_z)
+        
+        return outputs_xy, outputs_z
+
+
+# TranslationNet
+class TranslationNet(nn.Module):
+    def __init__(self, width, depth, num_iteration_steps, num_anchors=9, 
+                 freeze_bn=False, use_group_norm=True, num_groups_gn=None, name="translation_net"):
+        super(TranslationNet, self).__init__()
+        self.width = width
+        self.depth = depth
+        self.num_anchors = num_anchors
+        self.num_iteration_steps = num_iteration_steps
+        self.use_group_norm = use_group_norm
+        self.num_groups_gn = num_groups_gn
+        self.name = name
+        
+        # Convolution layers
+        self.convs = nn.ModuleList([
+            SeparableConvBlock(
+                num_channels=self.width, 
+                kernel_size=3, 
+                strides=1
+            ) for _ in range(self.depth)
+        ])
+        
+        # Initial translation heads for xy and z
+        self.initial_translation_xy_depthwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.width,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.width,
+            bias=True
+        )
+        
+        self.initial_translation_xy_pointwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.num_anchors * 2,  # x, y coordinates
+            kernel_size=1,
+            bias=True
+        )
+        
+        self.initial_translation_z_depthwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.width,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.width,
+            bias=True
+        )
+        
+        self.initial_translation_z_pointwise = nn.Conv2d(
+            in_channels=self.width,
+            out_channels=self.num_anchors,  # z coordinate
+            kernel_size=1,
+            bias=True
+        )
+        
+        # Normalization layers
+        if self.use_group_norm:
+            self.norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    GroupNormalization(num_channels=self.width, groups=self.num_groups_gn)
+                    for _ in range(5)  # 5 pyramid levels (P3-P7)
+                ])
+                for _ in range(self.depth)
+            ])
+        else:
+            self.norm_layers = nn.ModuleList([
+                nn.ModuleList([
+                    nn.BatchNorm2d(self.width, momentum=0.997, eps=1e-4)
+                    for _ in range(5)  # 5 pyramid levels (P3-P7)
+                ])
+                for _ in range(self.depth)
+            ])
+        
+        # Iterative subnet
+        self.iterative_submodel = IterativeTranslationSubNet(
+            width=self.width,
+            depth=self.depth - 1,
+            num_iteration_steps=self.num_iteration_steps,
+            num_anchors=self.num_anchors,
+            freeze_bn=freeze_bn,
+            use_group_norm=self.use_group_norm,
+            num_groups_gn=self.num_groups_gn
+        )
+        
+        self.activation = nn.SiLU()  # Equivalent to TensorFlow's Swish
+        self.level = 0
+        
+    def forward(self, inputs):
+        feature, level = inputs
+        
+        # Apply convolutional layers with normalization
+        for i in range(self.depth):
+            feature = self.convs[i](feature)
+            feature = self.norm_layers[i][self.level](feature)
+            feature = self.activation(feature)
+        
+        # Initial translation prediction
+        translation_xy = self.initial_translation_xy_depthwise(feature)
+        translation_xy = self.initial_translation_xy_pointwise(translation_xy)
+        
+        translation_z = self.initial_translation_z_depthwise(feature)
+        translation_z = self.initial_translation_z_pointwise(translation_z)
+        
+        # Iterative refinement
+        for i in range(self.num_iteration_steps):
+            # Concatenate feature, translation_xy and translation_z along channel dimension
+            iterative_input = torch.cat([feature, translation_xy, translation_z], dim=1)
+            
+            # Get delta translation from iterative subnet
+            delta_translation_xy, delta_translation_z = self.iterative_submodel(
+                [iterative_input, level], 
+                level_py=self.level, 
+                iter_step_py=i
+            )
+            
+            # Update translation
+            translation_xy = translation_xy + delta_translation_xy
+            translation_z = translation_z + delta_translation_z
+        
+        # Reshape xy output to [batch_size, -1, 2]
+        outputs_xy = translation_xy.permute(0, 2, 3, 1).contiguous()  # (B, H, W, anchors*2)
+        outputs_xy = outputs_xy.view(outputs_xy.shape[0], -1, 2)  # (B, num_boxes, 2)
+        
+        # Reshape z output to [batch_size, -1, 1]
+        outputs_z = translation_z.permute(0, 2, 3, 1).contiguous()  # (B, H, W, anchors)
+        outputs_z = outputs_z.view(outputs_z.shape[0], -1, 1)  # (B, num_boxes, 1)
+        
+        # Concatenate xy and z to get translation with shape [batch_size, -1, 3]
+        outputs = torch.cat([outputs_xy, outputs_z], dim=-1)  # (B, num_boxes, 3)
+        
+        self.level += 1
+        return outputs
+    
+##########################################
+# GroupNormalization
+##########################################
+class GroupNormalization(nn.Module):
+    """
+    Group normalization layer for PyTorch.
+    Equivalent to the TensorFlow implementation from TensorFlow Addons.
+    
+    Args:
+        num_channels: Number of channels in the input tensor
+        groups: Integer, the number of groups for Group Normalization.
+            Can be in the range [1, num_channels]. The input dimension 
+            must be divisible by the number of groups.
+        eps: Small float added to variance to avoid dividing by zero.
+        affine: If True, use learnable affine parameters (gamma, beta).
+    """
+    def __init__(self, num_channels, groups=2, eps=1e-5, affine=True):
+        super(GroupNormalization, self).__init__()
+        self.num_channels = num_channels
+        self.groups = groups
+        self.eps = eps
+        self.affine = affine
+        
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(num_channels))  # gamma
+            self.bias = nn.Parameter(torch.zeros(num_channels))   # beta
+        
+        # Make sure number of channels is divisible by groups
+        assert num_channels % groups == 0, f"Number of channels ({num_channels}) must be divisible by groups ({groups})"
+    
+    def forward(self, x):
+        # x shape: [batch_size, channels, height, width]
+        batch_size, channels, height, width = x.size()
+        
+        # Reshape input to separate groups
+        # [batch_size, groups, channels//groups, height, width]
+        x = x.view(batch_size, self.groups, -1, height, width)
+        
+        # Normalize over all dimensions except channels
+        mean = x.mean(dim=(2, 3, 4), keepdim=True)
+        var = x.var(dim=(2, 3, 4), keepdim=True, unbiased=False)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        
+        # Reshape back to original
+        x = x.view(batch_size, channels, height, width)
+        
+        # Apply affine transformation
+        if self.affine:
+            x = x * self.weight.view(1, channels, 1, 1) + self.bias.view(1, channels, 1, 1)
+        
+        return x
+
 
 ##########################################
 # subnet build 
@@ -591,7 +1181,327 @@ def build_subnets(num_classes, subnet_width, subnet_depth, subnet_num_iteration_
         name = 'class_net'
     )
 
-    return box_net, class_net
+    # Instantiate RotationNet
+    rotation_net = RotationNet(
+        width=subnet_width,
+        depth=subnet_depth,
+        num_values=num_rotation_parameters,
+        num_iteration_steps=subnet_num_iteration_steps,
+        num_anchors=num_anchors,
+        freeze_bn=freeze_bn,
+        use_group_norm=True,
+        num_groups_gn=num_groups_gn,
+        name = 'rotation_net'
+    )
+
+    # Instantiate TranslationNet
+    translation_net = TranslationNet(
+        width=subnet_width,
+        depth=subnet_depth,
+        num_iteration_steps=subnet_num_iteration_steps,
+        num_anchors=num_anchors,
+        freeze_bn=freeze_bn,
+        use_group_norm=True,
+        num_groups_gn=num_groups_gn,
+        name = 'translation_net'
+    )
+
+
+    return box_net, class_net, rotation_net, translation_net
+
+class RegressTranslation(nn.Module):
+    """
+    PyTorch module for applying regression offset values to translation anchors 
+    to get the 2D translation centerpoint and Tz.
+    """
+    
+    def __init__(self):
+        """Initializer for the RegressTranslation layer."""
+        super(RegressTranslation, self).__init__()
+    
+    def forward(self, inputs):
+        """
+        Apply regression to translation anchors.
+        
+        Args:
+            inputs: List containing [translation_anchors, regression_offsets]
+                translation_anchors: tensor of shape (B, N, 3) where the last dimension is (x, y, stride)
+                regression_offsets: tensor of shape (B, N, 3) where the last dimension is (dx, dy, tz)
+                
+        Returns:
+            tensor of shape (B, N, 3) containing the transformed coordinates (x, y, tz)
+        """
+        translation_anchors, regression_offsets = inputs
+        return self.translation_transform_inv(translation_anchors, regression_offsets)
+    
+    def translation_transform_inv(self, translation_anchors, deltas, scale_factors=None):
+        """
+        Applies the predicted 2D translation center point offsets (deltas) to the translation_anchors
+        
+        Args:
+            translation_anchors: Tensor of shape (B, N, 3), where B is the batch size, 
+                                 N the number of boxes and 3 values for (x, y, stride)
+            deltas: Tensor of shape (B, N, 3). The first 2 values (dx, dy) are factors of 
+                    the stride, and the third is Tz
+            scale_factors: Optional scaling factors for the deltas
+            
+        Returns:
+            A tensor of shape (B, N, 3) with the transformed coordinates (x, y, tz)
+        """
+        stride = translation_anchors[:, :, 2]
+        
+        if scale_factors is not None:
+            x = translation_anchors[:, :, 0] + (deltas[:, :, 0] * scale_factors[0] * stride)
+            y = translation_anchors[:, :, 1] + (deltas[:, :, 1] * scale_factors[1] * stride)
+        else:
+            x = translation_anchors[:, :, 0] + (deltas[:, :, 0] * stride)
+            y = translation_anchors[:, :, 1] + (deltas[:, :, 1] * stride)
+        
+        Tz = deltas[:, :, 2]
+        
+        # Stack the predictions to form the final output
+        pred_translations = torch.stack([x, y, Tz], dim=2)  # x,y 2D Image coordinates and Tz
+        
+        return pred_translations
+    
+class CalculateTxTy(nn.Module):
+    """
+    PyTorch module for calculating the Tx- and Ty-Components of the Translation vector 
+    with a given 2D-point and the intrinsic camera parameters.
+    """
+    
+    def __init__(self):
+        """
+        Initializer for a CalculateTxTy layer.
+        """
+        super(CalculateTxTy, self).__init__()
+    
+    def forward(self, inputs, fx, fy, px, py, tz_scale, image_scale):
+        """
+        Calculate the translation vector.
+        
+        Args:
+            inputs: tensor of shape (B, N, 3) containing (x, y, tz)
+            fx, fy, px, py: camera intrinsic parameters
+            tz_scale: scaling factor for the z component
+            image_scale: scaling factor for the image coordinates
+            
+        Returns:
+            tensor of shape (B, N, 3) containing the translation vector (tx, ty, tz)
+        """
+        # Expand dimensions for proper broadcasting
+        fx = fx.unsqueeze(-1)  # (B, 1)
+        fy = fy.unsqueeze(-1)  # (B, 1)
+        px = px.unsqueeze(-1)  # (B, 1)
+        py = py.unsqueeze(-1)  # (B, 1)
+        tz_scale = tz_scale.unsqueeze(-1)  # (B, 1)
+        image_scale = image_scale.unsqueeze(-1)  # (B, 1)
+        
+        # Extract components from inputs
+        x = inputs[:, :, 0] / image_scale  # Scale the x-coordinate
+        y = inputs[:, :, 1] / image_scale  # Scale the y-coordinate
+        tz = inputs[:, :, 2] * tz_scale    # Scale the z-component
+        
+        # Apply camera calibration parameters
+        x = x - px
+        y = y - py
+        
+        # Calculate tx and ty using the pinhole camera model
+        tx = torch.mul(x, tz) / fx
+        ty = torch.mul(y, tz) / fy
+        
+        # Stack the results to create the translation vector
+        output = torch.stack([tx, ty, tz], dim=-1)
+        
+        return output
+    
+class RegressBoxes(nn.Module):
+    """
+    PyTorch module for applying regression offset values to anchor boxes to get the 2D bounding boxes.
+    """
+    def __init__(self):
+        super(RegressBoxes, self).__init__()
+
+    def forward(self, inputs):
+        """
+        Apply regression to anchor boxes.
+        
+        Args:
+            inputs: List containing [anchors, regression]
+                anchors: Tensor of shape (B, N, 4) containing the anchor boxes
+                regression: Tensor of shape (B, N, 4) containing the offsets
+        
+        Returns:
+            Tensor of shape (B, N, 4) containing the predicted boxes
+        """
+        anchors, regression = inputs
+        return self.bbox_transform_inv(anchors, regression)
+    
+    def bbox_transform_inv(self, boxes, deltas, scale_factors=None):
+        """
+        Reconstructs the 2D bounding boxes using the anchor boxes and the predicted deltas 
+        of the anchor boxes to the bounding boxes.
+        
+        Args:
+            boxes: Tensor containing the anchor boxes with shape (..., 4)
+            deltas: Tensor containing the offsets of the anchor boxes to the bounding boxes with shape (..., 4)
+            scale_factors: Optional scaling factor for the deltas
+            
+        Returns:
+            Tensor containing the reconstructed 2D bounding boxes with shape (..., 4)
+        """
+        # Calculate center, width, height of anchor boxes
+        cxa = (boxes[..., 0] + boxes[..., 2]) / 2
+        cya = (boxes[..., 1] + boxes[..., 3]) / 2
+        wa = boxes[..., 2] - boxes[..., 0]
+        ha = boxes[..., 3] - boxes[..., 1]
+        
+        # Extract regression values
+        ty, tx, th, tw = deltas[..., 0], deltas[..., 1], deltas[..., 2], deltas[..., 3]
+        
+        # Apply scale factors if provided
+        if scale_factors:
+            ty = ty * scale_factors[0]
+            tx = tx * scale_factors[1]
+            th = th * scale_factors[2]
+            tw = tw * scale_factors[3]
+        
+        # Apply transformations
+        w = torch.exp(tw) * wa
+        h = torch.exp(th) * ha
+        cy = ty * ha + cya
+        cx = tx * wa + cxa
+        
+        # Calculate box coordinates
+        ymin = cy - h / 2.
+        xmin = cx - w / 2.
+        ymax = cy + h / 2.
+        xmax = cx + w / 2.
+        
+        # Stack to create box tensor
+        return torch.stack([xmin, ymin, xmax, ymax], dim=-1)
+    
+class ClipBoxes(nn.Module):
+    """
+    PyTorch module that clips 2D bounding boxes so that they are inside the image
+    """
+    def __init__(self):
+        super(ClipBoxes, self).__init__()
+    
+    def forward(self, inputs):
+        """
+        Clip boxes to image boundaries.
+        
+        Args:
+            inputs: List containing [image, boxes]
+                image: Tensor of shape (B, C, H, W)
+                boxes: Tensor of shape (B, N, 4)
+            
+        Returns:
+            Tensor of shape (B, N, 4) containing clipped boxes
+        """
+        image, boxes = inputs
+        
+        # Get image dimensions - note that in PyTorch images are (B, C, H, W)
+        height = image.shape[2]
+        width = image.shape[3]
+        
+        # Clip box coordinates to image boundaries
+        x1 = torch.clamp(boxes[:, :, 0], 0, width - 1)
+        y1 = torch.clamp(boxes[:, :, 1], 0, height - 1)
+        x2 = torch.clamp(boxes[:, :, 2], 0, width - 1)
+        y2 = torch.clamp(boxes[:, :, 3], 0, height - 1)
+        
+        # Stack to create the final tensor
+        return torch.stack([x1, y1, x2, y2], dim=2)
+
+##########################################
+# Build EfficientPose Model
+##########################################
+def apply_subnets_to_feature_maps(box_net, class_net, rotation_net, translation_net, fpn_feature_maps, 
+                                 image_input, camera_parameters, input_size, anchor_parameters=None):
+    
+
+    classification = []
+    for i, feature in enumerate(fpn_feature_maps):
+        classification.append(class_net(feature, i))
+    classification = torch.cat(classification, dim=1)
+
+    print(f"Classification shape: {classification.shape}")
+    
+    # Apply box network to feature maps and concatenate results
+    bbox_regression = []
+    for i, feature in enumerate(fpn_feature_maps):
+        bbox_regression.append(box_net(feature, i))
+    bbox_regression = torch.cat(bbox_regression, dim=1)
+
+    print(f"Bbox regression shape: {bbox_regression.shape}")
+    
+    # Apply rotation network to feature maps and concatenate results
+    rotation = []
+    for i, feature in enumerate(fpn_feature_maps):
+        rotation.append(rotation_net([feature, i]))
+    rotation = torch.cat(rotation, dim=1)
+    
+
+    print(f"Rotation shape: {rotation.shape}")
+
+    # Apply translation network to feature maps and concatenate results
+    translation_raw = []
+    for i, feature in enumerate(fpn_feature_maps):
+        translation_raw.append(translation_net([feature, i]))
+    translation_raw = torch.cat(translation_raw, dim=1)
+
+    print(f"Translation raw shape: {translation_raw.shape}")
+
+    anchors, translation_anchors = anchors_for_shape((input_size, input_size), anchor_params=anchor_parameters)
+    translation_anchors_input = translation_anchors.unsqueeze(0)
+
+    print(f"Anchors shape: {anchors.shape}")
+
+    print(f"Translation anchors shape: {translation_anchors_input.shape}")
+
+    # Apply regression to translation anchors
+    regress_translation = RegressTranslation()
+    translation_xy_Tz = regress_translation([translation_anchors_input, translation_raw])
+
+    print(f"Translation xy Tz shape: {translation_xy_Tz.shape}")
+
+    calculate_txty = CalculateTxTy()
+    translation = calculate_txty(
+        translation_xy_Tz,
+        fx=camera_parameters[:, 0],
+        fy=camera_parameters[:, 1],
+        px=camera_parameters[:, 2],
+        py=camera_parameters[:, 3],
+        tz_scale=camera_parameters[:, 4],
+        image_scale=camera_parameters[:, 5]
+    )
+
+    print(f"Translation shape: {translation.shape}")
+
+    anchors_tensor = anchors.unsqueeze(0).to(translation_raw.device)
+
+    print(f"Anchors tensor shape: {anchors_tensor.shape}")
+
+    # Apply regression to get predicted bounding boxes
+    regress_boxes = RegressBoxes()
+    bboxes = regress_boxes([anchors_tensor, bbox_regression[..., :4]])
+
+    print(f"Bboxes shape: {bboxes.shape}")
+
+    # Clip bounding boxes to image boundaries
+    clip_boxes = ClipBoxes()
+    bboxes = clip_boxes([image_input, bboxes])
+
+    print(f"Clipped bboxes shape: {bboxes.shape}")
+
+    # Concatenate rotation and translation outputs to transformation output
+    transformation = torch.cat([rotation, translation], dim=-1)
+
+    print(f"Transformation shape: {transformation.shape}")
+
+    return classification, bbox_regression, rotation, translation, bboxes, transformation
 
     
 class BuildEfficientPoseModel(nn.Module):
@@ -603,7 +1513,6 @@ class BuildEfficientPoseModel(nn.Module):
         scaled_parameters = get_scaled_parameters(phi)
         self.phi = phi
         self.input_size = scaled_parameters["input_size"] 
-        self.input_shape = (3, self.input_size, self.input_size)
         self.bifpn_width = scaled_parameters["bifpn_width"]
         self.bifpn_depth = scaled_parameters["bifpn_depth"]
         self.subnet_depth = scaled_parameters["subnet_depth"]
@@ -615,8 +1524,64 @@ class BuildEfficientPoseModel(nn.Module):
         self.num_anchors = num_anchors
         self.num_rotation_parameters = num_rotation_parameters
         self.score_threshold = score_threshold
+        self.input_shape = torch.randn(1, 3, self.input_size, self.input_size)
+        self.camera_parameters_input = torch.randn(1, 6)
+
+        # print input_shape
+        print(f"Input shape: {self.input_shape.shape}")
+        # print camera_parameters_input
+        print(f"Camera parameters input shape: {self.camera_parameters_input.shape}")
         
         self.feature_extractor = self._build_backbone()
+
+        features = self.feature_extractor(self.input_shape)  # Extract features as a dictionary
+        backbone_feature_maps = [features[node_name] for node_name in ["C1", "C2", "C3", "C4", "C5"]]
+
+        # ✅ Build BiFPN
+        self.fpn_feature_maps = build_BiFPN(
+            backbone_feature_maps,
+            bifpn_depth=self.bifpn_depth,
+            bifpn_width=self.bifpn_width,
+            freeze_bn=self.freeze_bn
+        )
+    
+        # ✅ Build subnets
+        box_net, class_net, rotation_net, translation_net = build_subnets(
+            num_classes=self.num_classes,
+            subnet_width=self.bifpn_width,
+            subnet_depth=self.subnet_depth,
+            subnet_num_iteration_steps=self.subnet_num_iteration_steps,
+            num_groups_gn=self.num_groups_gn,
+            num_rotation_parameters=self.num_rotation_parameters,
+            freeze_bn=self.freeze_bn,
+            num_anchors=self.num_anchors
+        )
+
+        self.box_net = box_net
+        self.class_net = class_net
+        self.rotation_net = rotation_net
+        self.translation_net = translation_net
+
+        # ✅ Apply subnets to feature maps
+        classification, bbox_regression, rotation, translation, transformation, bboxes = apply_subnets_to_feature_maps(
+            box_net, class_net, rotation_net, translation_net,
+            self.fpn_feature_maps, self.input_shape, self.camera_parameters_input, self.input_size
+        )
+
+
+        # Create FilterDetections module
+        self.filter_detections = FilterDetections(
+            num_rotation_parameters=num_rotation_parameters,
+            num_translation_parameters=3,
+            score_threshold=score_threshold
+        )
+
+        filtered_detections = self.filter_detections([bboxes, classification, rotation, translation])
+
+        # print("filtered detections:")
+        # print(filtered_detections)
+        # print()
+
 
     def _build_backbone(self):
         """Build the EfficientNet backbone"""
@@ -660,255 +1625,30 @@ class BuildEfficientPoseModel(nn.Module):
 
     def forward(self, x):
         """Returns feature maps in TensorFlow-like order"""
-        features = self.feature_extractor(x)  # Extract features as a dictionary
-        backbone_feature_maps = [features[node_name] for node_name in ["C1", "C2", "C3", "C4", "C5"]]
 
-        # ✅ Build BiFPN
-        fpn_feature_maps = build_BiFPN(
-            backbone_feature_maps,
-            bifpn_depth=self.bifpn_depth,
-            bifpn_width=self.bifpn_width,
-            freeze_bn=self.freeze_bn
-        )
-
-        # ✅ Build subnets
-        box_net, class_net = build_subnets(
-            num_classes=self.num_classes,
-            subnet_width=self.bifpn_width,
-            subnet_depth=self.subnet_depth,
-            subnet_num_iteration_steps=self.subnet_num_iteration_steps,
-            num_groups_gn=self.num_groups_gn,
-            num_rotation_parameters=self.num_rotation_parameters,
-            freeze_bn=self.freeze_bn,
-            num_anchors=self.num_anchors
-        )
+        return self.fpn_feature_maps
 
 
-
-        return fpn_feature_maps, box_net, class_net
-
-
-
-class EfficientPoseModel(nn.Module):
-    def __init__(self, input_size=512, phi=0):
-        super(EfficientPoseModel, self).__init__()
-        
-        # Get scaling parameters based on phi value
-        self.input_size = input_size
-        params = get_scaled_parameters(phi)
-        self.bifpn_width = params['bifpn_width']
-        self.bifpn_depth = params['bifpn_depth']
-        
-        # Backbone with proper downsampling pattern
-        # These should match the TensorFlow downsampling pattern
-        self.backbone_stage1 = nn.Conv2d(3, 32, kernel_size=3, stride=4, padding=1)  # 4× downsample
-        self.backbone_stage2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1) # 8× total
-        self.backbone_stage3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1) # 16× total
-        self.backbone_stage4 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1) # 32× total
-        self.backbone_stage5 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1) # 64× total
-        
-        # Output head (example: keypoint regression)
-        self.output_head = nn.Conv2d(self.bifpn_width, 17, kernel_size=3, padding=1)
-        self.activation = nn.Sigmoid()
-        
-    def forward(self, x):
-        # Extract features from backbone
-        C1 = self.backbone_stage1(x)
-        C2 = self.backbone_stage2(C1)
-        C3 = self.backbone_stage3(C2)
-        C4 = self.backbone_stage4(C3)
-        C5 = self.backbone_stage5(C4)
-        
-        backbone_features = [C1, C2, C3, C4, C5]
-        
-        # Build BiFPN
-        bifpn_features = build_BiFPN(
-            backbone_features,
-            bifpn_depth=self.bifpn_depth,
-            bifpn_width=self.bifpn_width,
-            freeze_bn=False
-        )
-        
-        # Unpack BiFPN features - directly use P3 for output
-        P3, _, _, _, _ = bifpn_features
-        
-        # Apply output head to P3
-        outputs = self.activation(self.output_head(P3))
-        
-        return outputs
-    
-def count_parameters(model):
-    """Count the total parameters, trainable parameters, and non-trainable parameters in a PyTorch model"""
-    total_params = sum(p.numel() for p in model.parameters())
-    
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    non_trainable_params = total_params - trainable_params
-    
-    print(f"Total params: {total_params:,}")
-    print(f"Trainable params: {trainable_params:,}")
-    print(f"Non-trainable params: {non_trainable_params:,}")
-    
-    return total_params, trainable_params, non_trainable_params
-
-
-# Add a test function for BoxNet
-def test_boxnet():
-    print("\n===== PyTorch BoxNet Test =====")
-    
-    # Parameters (same as in TensorFlow test)
-    width = 64
-    depth = 3
-    num_anchors = 9
-    
-    # Create BoxNet instance
-
-    box_net = BoxNet(width=width, depth=depth, num_anchors=num_anchors)
-    
-    # Print network structure
-    print(f"Width: {box_net.width}")
-    print(f"Depth: {box_net.depth}")
-    print(f"Num anchors: {box_net.num_anchors}")
-    print(f"Num values: {box_net.num_values}")
-    print(f"Number of convolution layers: {len(box_net.convs)}")
-    print(f"Number of BN layers per level: {len(box_net.bns[0]) if box_net.bns else 0}")
-    
-    # Create random input (matching the TensorFlow test)
-    batch_size = 1
-    feature_size = 32
-    
-    # PyTorch uses BCHW format (TensorFlow uses BHWC)
-    feature_map = torch.randn(batch_size, width, feature_size, feature_size)
-    level = 0
-    
-    # Run inference
-    print("\nRunning inference on test feature map...")
-    output = box_net(feature_map, level)
-    
-    # Print results
-    print(f"Input shape: {feature_map.shape} (BCHW format)")
-    print(f"Output shape: {output.shape}")
-    print(f"Expected output shape: torch.Size([{batch_size}, {feature_size * feature_size * num_anchors}, 4])")
-    
-    # Verify shape
-    expected_shape = (batch_size, feature_size * feature_size * num_anchors, 4)
-    if output.shape == expected_shape:
-        print("✓ Output shape is correct!")
-    else:
-        print("✗ Output shape does not match expected shape!")
-    
-    # Print first few values
-    print("\nFirst 3 output values:")
-    print(output[0, :3, :].detach().numpy())
-    
-    # Additional check: is level incremented?
-    print(f"\nLevel after forward pass: {box_net.level} (should be 1)")
-    
-    return output
 
 # add main function to test the function
 if __name__ == "__main__":
     # # Test the function
-    # phi = 0
-    # scaled_parameters = get_scaled_parameters(phi)
-    # print(scaled_parameters)
-    # # Expected output: {'input_size': 512, 'bifpn_width': 64, 'bifpn_depth': 3, 'subnet_depth': 3, 'subnet_num_iteration_steps': 1, 'num_groups_gn': 4, 'backbone_class': <function efficientnet_b0 at 0x7f8c6b5e8d30>}
 
-
-    # # Create dummy backbone feature maps with realistic shapes
-    # batch_size = 2
-    # C1 = torch.randn(batch_size, 32, 128, 128)
-    # C2 = torch.randn(batch_size, 64, 64, 64)
-    # C3 = torch.randn(batch_size, 128, 32, 32)
-    # C4 = torch.randn(batch_size, 256, 16, 16)
-    # C5 = torch.randn(batch_size, 512, 8, 8)
-
-    # # Gather backbone features
-    # backbone_features = [C1, C2, C3, C4, C5]
-
-    # # Set BiFPN parameters
-    # num_channels = 160
-    # freeze_bn = True
-
-    # # Build the first BiFPN layer
-    # P3, P4, P5, P6, P7 = build_BiFPN_layer(
-    #     backbone_features, 
-    #     num_channels=num_channels, 
-    #     idx_BiFPN_layer=0, 
-    #     freeze_bn=freeze_bn
-    # )
-
-    # # Print output shapes
-    # print("BiFPN Output Feature Maps:")
-    # print(f"P3 shape: {P3.shape}")  # Should be [batch_size, num_channels, 32, 32]
-    # print(f"P4 shape: {P4.shape}")  # Should be [batch_size, num_channels, 16, 16]
-    # print(f"P5 shape: {P5.shape}")  # Should be [batch_size, num_channels, 8, 8]
-    # print(f"P6 shape: {P6.shape}")  # Should be [batch_size, num_channels, 4, 4]
-    # print(f"P7 shape: {P7.shape}")  # Should be [batch_size, num_channels, 2, 2]
-
-    # # Create model
-    # model = EfficientPoseModel(input_size=512)
-    # print(model)
-
-    # count_parameters(model)
-
-    # # Test inference with a dummy image
-    # dummy_input = torch.rand(1, 3, 512, 512)
-    # predictions = model(dummy_input)
-    # print(f"Prediction shape: {predictions.shape}")
 
     # build_EfficientPose
     phi = 1  # Select EfficientNet-B2
-    model = BuildEfficientPoseModel(phi)
+    num_rotation_parameters = 3
+    num_classes = 1
+    num_anchors = 9
+    freeze_bn = True
+    score_threshold = 0.7
+    model = BuildEfficientPoseModel(phi, num_classes, num_anchors, freeze_bn, score_threshold, num_rotation_parameters)
 
-    # Create dummy input
-    dummy_input = torch.randn(1, 3, model.input_size, model.input_size)
-
-    # Get feature maps
-    feature_maps, box_net = model(dummy_input)
-
-    
     # Print feature maps in TensorFlow-like format
     print("\nBiFPN feature maps shape:")
-    for i, fm in enumerate(feature_maps):
+    for i, fm in enumerate(model.fpn_feature_maps):
         print(f"Tensor(\"FPN{i+1}\", shape={tuple(fm.shape)}, dtype=float32)")
 
 
-    print("\n===== PyTorch BoxNet Test =====")
-
-    # Print network structure
-    print(f"Width: {box_net.width}")
-    print(f"Depth: {box_net.depth}")
-    print(f"Num anchors: {box_net.num_anchors}")
-    print(f"Num values: {box_net.num_values}")
-    print(f"Number of convolution layers: {len(box_net.convs)}")
-    print(f"Number of BN layers per level: {len(box_net.bns[0]) if box_net.bns else 0}")
-
-    # Create random input (matching the TensorFlow test)
-    batch_size = 1
-    feature_size = 32
-    
-    # PyTorch uses BCHW format (TensorFlow uses BHWC)
-    feature_map = torch.randn(batch_size, model.bifpn_width, feature_size, feature_size)
-    level = 0
 
 
-    # Run inference
-    print("\nRunning inference on test feature map...")
-    output = box_net(feature_map, level)
-
-    # Print results
-    print(f"Input shape: {feature_map.shape} (BCHW format)")
-    print(f"Output shape: {output.shape}")
-    print(f"Expected output shape: torch.Size([{batch_size}, {feature_size * feature_size * model.num_anchors}, 4])")
-    
-    # Verify shape
-    expected_shape = (batch_size, feature_size * feature_size * model.num_anchors, 4)
-    if output.shape == expected_shape:
-        print("✓ Output shape is correct!")
-    else:
-        print("✗ Output shape does not match expected shape!")
-    
-    # Print first few values
-    print("\nFirst 3 output values:")
-    print(output[0, :3, :].detach().numpy())
