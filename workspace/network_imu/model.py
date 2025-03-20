@@ -1534,12 +1534,12 @@ class BuildEfficientPoseModel(nn.Module):
         
         self.feature_extractor = self._build_backbone()
 
-        features = self.feature_extractor(self.input_shape)  # Extract features as a dictionary
-        backbone_feature_maps = [features[node_name] for node_name in ["C1", "C2", "C3", "C4", "C5"]]
+        self.features = self.feature_extractor(self.input_shape)  # Extract features as a dictionary
+        self.backbone_feature_maps = [self.features[node_name] for node_name in ["C1", "C2", "C3", "C4", "C5"]]
 
         # ✅ Build BiFPN
         self.fpn_feature_maps = build_BiFPN(
-            backbone_feature_maps,
+            self.backbone_feature_maps,
             bifpn_depth=self.bifpn_depth,
             bifpn_width=self.bifpn_width,
             freeze_bn=self.freeze_bn
@@ -1568,20 +1568,22 @@ class BuildEfficientPoseModel(nn.Module):
             self.fpn_feature_maps, self.input_shape, self.camera_parameters_input, self.input_size
         )
 
+        self.classification = classification
+        self.bbox_regression = bbox_regression
+        self.rotation = rotation
+        self.translation = translation
+        self.transformation = transformation
+        self.bboxes = bboxes
 
         # Create FilterDetections module
         self.filter_detections = FilterDetections(
-            num_rotation_parameters=num_rotation_parameters,
-            num_translation_parameters=3,
-            score_threshold=score_threshold
+            num_rotation_parameters = self.num_rotation_parameters,
+            num_translation_parameters = 3,
+            score_threshold = self.score_threshold 
         )
 
-        filtered_detections = self.filter_detections([bboxes, classification, rotation, translation])
-
-        # print("filtered detections:")
-        # print(filtered_detections)
-        # print()
-
+        self.filtered_detections = self.filter_detections([self.bboxes, self.classification, self.rotation, self.translation])
+        
 
     def _build_backbone(self):
         """Build the EfficientNet backbone"""
@@ -1623,12 +1625,130 @@ class BuildEfficientPoseModel(nn.Module):
 
 
 
-    def forward(self, x):
-        """Returns feature maps in TensorFlow-like order"""
+    def forward(self, inference=False):
+        print("Forward pass")
 
-        return self.fpn_feature_maps
+def build_EfficientPose(phi,
+                        num_classes=8,
+                        num_anchors=9,
+                        freeze_bn=False,
+                        score_threshold=0.5,
+                        anchor_parameters=None,
+                        num_rotation_parameters=3,
+                        print_architecture=True):
+    
+        # Select parameters according to the given phi
+        assert phi in range(7)
+        scaled_parameters = get_scaled_parameters(phi)
+        phi = phi
+        input_size = scaled_parameters["input_size"] 
+        bifpn_width = scaled_parameters["bifpn_width"]
+        bifpn_depth = scaled_parameters["bifpn_depth"]
+        subnet_depth = scaled_parameters["subnet_depth"]
+        subnet_num_iteration_steps = scaled_parameters["subnet_num_iteration_steps"]
+        num_groups_gn = scaled_parameters["num_groups_gn"]
+        backbone_class = scaled_parameters["backbone_class"]
+        freeze_bn = freeze_bn
+        num_classes = num_classes
+        num_anchors = num_anchors
+        num_rotation_parameters = num_rotation_parameters
+        score_threshold = score_threshold
+        input_shape = torch.randn(1, 3, input_size, input_size)
+        camera_parameters_input = torch.randn(1, 6)
 
+        # print input_shape
+        print(f"Input shape: {input_shape.shape}")
+        # print camera_parameters_input
+        print(f"Camera parameters input shape: {camera_parameters_input.shape}")
+        
+        feature_extractor = _build_backbone_two(phi)
 
+        features = feature_extractor(input_shape)  # Extract features as a dictionary
+        backbone_feature_maps = [features[node_name] for node_name in ["C1", "C2", "C3", "C4", "C5"]]
+
+        # ✅ Build BiFPN
+        fpn_feature_maps = build_BiFPN(
+            backbone_feature_maps,
+            bifpn_depth=bifpn_depth,
+            bifpn_width=bifpn_width,
+            freeze_bn=freeze_bn
+        )
+    
+        # ✅ Build subnets
+        box_net, class_net, rotation_net, translation_net = build_subnets(
+            num_classes=num_classes,
+            subnet_width=bifpn_width,
+            subnet_depth=subnet_depth,
+            subnet_num_iteration_steps=subnet_num_iteration_steps,
+            num_groups_gn=num_groups_gn,
+            num_rotation_parameters=num_rotation_parameters,
+            freeze_bn=freeze_bn,
+            num_anchors=num_anchors
+        )
+
+        # ✅ Apply subnets to feature maps
+        classification, bbox_regression, rotation, translation, transformation, bboxes = apply_subnets_to_feature_maps(
+            box_net, class_net, rotation_net, translation_net,
+            fpn_feature_maps, input_shape, camera_parameters_input, input_size
+        )
+
+        efficientpose_train = nn.Sequential(
+            box_net,
+            class_net,
+            rotation_net,
+            translation_net
+        )
+
+        # Create FilterDetections module
+        filter_detections = FilterDetections(
+            num_rotation_parameters = num_rotation_parameters,
+            num_translation_parameters = 3,
+            score_threshold = score_threshold 
+        )
+
+        filtered_detections = filter_detections([bboxes, classification, rotation, translation])
+        
+        efficientpose_prediction = nn.Sequential(filtered_detections)
+
+        return efficientpose_train, efficientpose_prediction
+
+def _build_backbone_two(phi):
+    """Build the EfficientNet backbone"""
+
+    if phi == 0:
+        from torchvision.models import EfficientNet_B0_Weights
+        backbone = models.efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+    elif phi == 1:
+        from torchvision.models import EfficientNet_B1_Weights
+        backbone = models.efficientnet_b1(weights=EfficientNet_B1_Weights.IMAGENET1K_V1)
+    elif phi == 2:
+        from torchvision.models import EfficientNet_B2_Weights
+        backbone = models.efficientnet_b2(weights=EfficientNet_B2_Weights.IMAGENET1K_V1)
+    elif phi == 3:
+        from torchvision.models import EfficientNet_B3_Weights
+        backbone = models.efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+    elif phi == 4:
+        from torchvision.models import EfficientNet_B4_Weights
+        backbone = models.efficientnet_b4(weights=EfficientNet_B4_Weights.IMAGENET1K_V1)
+    elif phi == 5:
+        from torchvision.models import EfficientNet_B5_Weights
+        backbone = models.efficientnet_b5(weights=EfficientNet_B5_Weights.IMAGENET1K_V1)
+    elif phi == 6:
+        from torchvision.models import EfficientNet_B6_Weights
+        backbone = models.efficientnet_b6(weights=EfficientNet_B6_Weights.IMAGENET1K_V1)
+
+    # Corrected layer names for feature extraction based on your printed architecture
+    return_nodes = {
+        "features.1": "C1",  # Low-level features
+        "features.2": "C2",  # Mid-level features
+        "features.3": "C3",  # Higher-level features
+        "features.5": "C4",  # Deep features
+        "features.7": "C5"   # Final feature map
+    }
+
+    # Create the feature extractor with the corrected layers
+    feature_extractor = create_feature_extractor(backbone, return_nodes=return_nodes)
+    return feature_extractor
 
 # add main function to test the function
 if __name__ == "__main__":
@@ -1648,6 +1768,9 @@ if __name__ == "__main__":
     print("\nBiFPN feature maps shape:")
     for i, fm in enumerate(model.fpn_feature_maps):
         print(f"Tensor(\"FPN{i+1}\", shape={tuple(fm.shape)}, dtype=float32)")
+
+
+    # efficientpose_train, efficientpose_prediction = build_EfficientPose(phi, num_classes, num_anchors, freeze_bn, score_threshold, num_rotation_parameters)
 
 
 
