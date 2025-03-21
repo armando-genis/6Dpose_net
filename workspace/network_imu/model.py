@@ -146,41 +146,44 @@ def prepare_feature_maps_for_BiFPN(C3, C4, C5, num_channels, freeze_bn):
         Tuple[torch.Tensor]: Processed feature maps (P3_in, P4_in_1, P4_in_2,
                                 P5_in_1, P5_in_2, P6_in, P7_in)
     """
+    # Get the device from one of the input tensors
+    device = C3.device
+    
     # Process C3: apply 1x1 conv and BN.
-    conv_p3 = nn.Conv2d(in_channels=C3.shape[1], out_channels=num_channels, kernel_size=1, bias=False)
+    conv_p3 = nn.Conv2d(in_channels=C3.shape[1], out_channels=num_channels, kernel_size=1, bias=False).to(device)
     P3_in = conv_p3(C3)
-    bn_p3 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON)
+    bn_p3 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON).to(device)
     P3_in = bn_p3(P3_in)
     
     # Process C4: two branches.
-    conv_p4_1 = nn.Conv2d(in_channels=C4.shape[1], out_channels=num_channels, kernel_size=1, bias=False)
+    conv_p4_1 = nn.Conv2d(in_channels=C4.shape[1], out_channels=num_channels, kernel_size=1, bias=False).to(device)
     P4_in_1 = conv_p4_1(C4)
-    bn_p4_1 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON)
+    bn_p4_1 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON).to(device)
     P4_in_1 = bn_p4_1(P4_in_1)
     
-    conv_p4_2 = nn.Conv2d(in_channels=C4.shape[1], out_channels=num_channels, kernel_size=1, bias=False)
+    conv_p4_2 = nn.Conv2d(in_channels=C4.shape[1], out_channels=num_channels, kernel_size=1, bias=False).to(device)
     P4_in_2 = conv_p4_2(C4)
-    bn_p4_2 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON)
+    bn_p4_2 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON).to(device)
     P4_in_2 = bn_p4_2(P4_in_2)
     
     # Process C5: two branches.
-    conv_p5_1 = nn.Conv2d(in_channels=C5.shape[1], out_channels=num_channels, kernel_size=1, bias=False)
+    conv_p5_1 = nn.Conv2d(in_channels=C5.shape[1], out_channels=num_channels, kernel_size=1, bias=False).to(device)
     P5_in_1 = conv_p5_1(C5)
-    bn_p5_1 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON)
+    bn_p5_1 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON).to(device)
     P5_in_1 = bn_p5_1(P5_in_1)
     
-    conv_p5_2 = nn.Conv2d(in_channels=C5.shape[1], out_channels=num_channels, kernel_size=1, bias=False)
+    conv_p5_2 = nn.Conv2d(in_channels=C5.shape[1], out_channels=num_channels, kernel_size=1, bias=False).to(device)
     P5_in_2 = conv_p5_2(C5)
-    bn_p5_2 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON)
+    bn_p5_2 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON).to(device)
     P5_in_2 = bn_p5_2(P5_in_2)
     
     # Process P6: from C5.
-    conv_p6 = nn.Conv2d(in_channels=C5.shape[1], out_channels=num_channels, kernel_size=1, bias=False)
+    conv_p6 = nn.Conv2d(in_channels=C5.shape[1], out_channels=num_channels, kernel_size=1, bias=False).to(device)
     P6_in = conv_p6(C5)
-    bn_p6 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON)
+    bn_p6 = BatchNormalization(num_features=num_channels, freeze=freeze_bn, momentum=MOMENTUM, eps=EPSILON).to(device)
     P6_in = bn_p6(P6_in)
     # Using a max-pooling layer to downsample. Here, kernel_size=3, stride=2, and padding=1 mimic 'same' padding.
-    maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+    maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1).to(device)
     P6_in = maxpool(P6_in)
     
     # Process P7: further downsample P6_in.
@@ -209,33 +212,37 @@ def single_BiFPN_merge_step(feature_map_other_level, feature_maps_current_level,
     Returns:
         torch.Tensor: The merged feature map.
     """
+    # Get the device from input tensors
+    device = feature_map_other_level.device
+    
     if upsampling:
         # Upsample to match spatial size of the current level.
         target_size = feature_maps_current_level[0].shape[-2:]
         feature_map_resampled = F.interpolate(feature_map_other_level, size=target_size, mode='nearest')
     else:
         # Downsample using max pooling.
-        feature_map_resampled = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)(feature_map_other_level)
+        maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1).to(device)
+        feature_map_resampled = maxpool(feature_map_other_level)
     
     # Fuse the features using a weighted addition.
     num_inputs = len(feature_maps_current_level) + 1
-    add_layer = wBiFPNAdd(num_inputs)
+    add_layer = wBiFPNAdd(num_inputs).to(device)
     merged_feature_map = add_layer(feature_maps_current_level + [feature_map_resampled])
     
     # Apply Swish activation.
     merged_feature_map = F.silu(merged_feature_map)
     
     # Apply a separable convolution block.
-    # Remove 'padding' parameter since it's calculated in SeparableConvBlock
     sep_conv = SeparableConvBlock(
         num_channels=num_channels, 
         kernel_size=3, 
-        strides=1,  # Changed from stride to strides to match your class
-        name=f'fpn_cells/cell_{idx_BiFPN_layer}/fnode{node_idx}/op_after_combine{op_idx}',  # Added name parameter
+        strides=1,
+        name=f'fpn_cells/cell_{idx_BiFPN_layer}/fnode{node_idx}/op_after_combine{op_idx}',
         freeze_bn=freeze_bn, 
         momentum=momentum, 
         eps=eps
-    )
+    ).to(device)
+    
     merged_feature_map = sep_conv(merged_feature_map)
     
     return merged_feature_map
@@ -782,15 +789,18 @@ class RotationNet(nn.Module):
         )
         
         self.activation = nn.SiLU()  # Equivalent to TensorFlow's Swish
-        self.level = 0
+        # self.level = 0
         
     def forward(self, inputs):
         feature, level = inputs
+
+        level_idx = level
+        level_idx = min(level_idx, 4)
         
         # Apply convolutional layers with normalization
         for i in range(self.depth):
             feature = self.convs[i](feature)
-            feature = self.norm_layers[i][self.level](feature)
+            feature = self.norm_layers[i][level_idx](feature)
             feature = self.activation(feature)
         
         # Initial rotation prediction
@@ -803,7 +813,7 @@ class RotationNet(nn.Module):
             iterative_input = torch.cat([feature, rotation], dim=1)
             
             # Get delta rotation from iterative subnet
-            delta_rotation = self.iterative_submodel([iterative_input, level], level_py=self.level, iter_step_py=i)
+            delta_rotation = self.iterative_submodel([iterative_input, level], level_py=level_idx, iter_step_py=i)
             
             # Update rotation
             rotation = rotation + delta_rotation
@@ -812,7 +822,7 @@ class RotationNet(nn.Module):
         outputs = rotation.permute(0, 2, 3, 1).contiguous()  # (B, H, W, anchors*values)
         outputs = outputs.view(outputs.shape[0], -1, self.num_values)  # (B, num_boxes, values)
         
-        self.level += 1
+        # self.level += 1
         return outputs
     
 
@@ -1056,15 +1066,18 @@ class TranslationNet(nn.Module):
         )
         
         self.activation = nn.SiLU()  # Equivalent to TensorFlow's Swish
-        self.level = 0
+        # self.level = 0
         
     def forward(self, inputs):
         feature, level = inputs
+
+        level_idx = level
+        level_idx = min(level_idx, 4)
         
         # Apply convolutional layers with normalization
         for i in range(self.depth):
             feature = self.convs[i](feature)
-            feature = self.norm_layers[i][self.level](feature)
+            feature = self.norm_layers[i][level_idx](feature)
             feature = self.activation(feature)
         
         # Initial translation prediction
@@ -1082,7 +1095,7 @@ class TranslationNet(nn.Module):
             # Get delta translation from iterative subnet
             delta_translation_xy, delta_translation_z = self.iterative_submodel(
                 [iterative_input, level], 
-                level_py=self.level, 
+                level_py=level_idx, 
                 iter_step_py=i
             )
             
@@ -1101,7 +1114,7 @@ class TranslationNet(nn.Module):
         # Concatenate xy and z to get translation with shape [batch_size, -1, 3]
         outputs = torch.cat([outputs_xy, outputs_z], dim=-1)  # (B, num_boxes, 3)
         
-        self.level += 1
+        # self.level += 1
         return outputs
     
 ##########################################
@@ -1534,18 +1547,7 @@ class BuildEfficientPoseModel(nn.Module):
         
         self.feature_extractor = self._build_backbone()
 
-        self.features = self.feature_extractor(self.input_shape)  # Extract features as a dictionary
-        self.backbone_feature_maps = [self.features[node_name] for node_name in ["C1", "C2", "C3", "C4", "C5"]]
-
-        # ✅ Build BiFPN
-        self.fpn_feature_maps = build_BiFPN(
-            self.backbone_feature_maps,
-            bifpn_depth=self.bifpn_depth,
-            bifpn_width=self.bifpn_width,
-            freeze_bn=self.freeze_bn
-        )
-    
-        # ✅ Build subnets
+        # Build subnets
         box_net, class_net, rotation_net, translation_net = build_subnets(
             num_classes=self.num_classes,
             subnet_width=self.bifpn_width,
@@ -1562,18 +1564,7 @@ class BuildEfficientPoseModel(nn.Module):
         self.rotation_net = rotation_net
         self.translation_net = translation_net
 
-        # ✅ Apply subnets to feature maps
-        classification, bbox_regression, rotation, translation, transformation, bboxes = apply_subnets_to_feature_maps(
-            box_net, class_net, rotation_net, translation_net,
-            self.fpn_feature_maps, self.input_shape, self.camera_parameters_input, self.input_size
-        )
-
-        self.classification = classification
-        self.bbox_regression = bbox_regression
-        self.rotation = rotation
-        self.translation = translation
-        self.transformation = transformation
-        self.bboxes = bboxes
+        self.fpn_feature_maps = None
 
         # Create FilterDetections module
         self.filter_detections = FilterDetections(
@@ -1582,7 +1573,6 @@ class BuildEfficientPoseModel(nn.Module):
             score_threshold = self.score_threshold 
         )
 
-        self.filtered_detections = self.filter_detections([self.bboxes, self.classification, self.rotation, self.translation])
         
 
     def _build_backbone(self):
@@ -1624,139 +1614,49 @@ class BuildEfficientPoseModel(nn.Module):
         return feature_extractor
 
 
-
-    def forward(self, inference=False):
-        print("Forward pass")
-
-def build_EfficientPose(phi,
-                        num_classes=8,
-                        num_anchors=9,
-                        freeze_bn=False,
-                        score_threshold=0.5,
-                        anchor_parameters=None,
-                        num_rotation_parameters=3,
-                        print_architecture=True):
-    
-        # Select parameters according to the given phi
-        assert phi in range(7)
-        scaled_parameters = get_scaled_parameters(phi)
-        phi = phi
-        input_size = scaled_parameters["input_size"] 
-        bifpn_width = scaled_parameters["bifpn_width"]
-        bifpn_depth = scaled_parameters["bifpn_depth"]
-        subnet_depth = scaled_parameters["subnet_depth"]
-        subnet_num_iteration_steps = scaled_parameters["subnet_num_iteration_steps"]
-        num_groups_gn = scaled_parameters["num_groups_gn"]
-        backbone_class = scaled_parameters["backbone_class"]
-        freeze_bn = freeze_bn
-        num_classes = num_classes
-        num_anchors = num_anchors
-        num_rotation_parameters = num_rotation_parameters
-        score_threshold = score_threshold
-        input_shape = torch.randn(1, 3, input_size, input_size)
-        camera_parameters_input = torch.randn(1, 6)
-
-        # print input_shape
-        print(f"Input shape: {input_shape.shape}")
-        # print camera_parameters_input
-        print(f"Camera parameters input shape: {camera_parameters_input.shape}")
+    def forward(self, image_input, camera_parameters_input, inference=False):
+        # Get the device from input tensors
+        device = image_input.device
         
-        feature_extractor = _build_backbone_two(phi)
-
-        features = feature_extractor(input_shape)  # Extract features as a dictionary
+        # Make sure camera parameters are on the same device
+        camera_parameters_input = camera_parameters_input.to(device)
+        
+        # Extract features
+        features = self.feature_extractor(image_input)  # Extract features as a dictionary
         backbone_feature_maps = [features[node_name] for node_name in ["C1", "C2", "C3", "C4", "C5"]]
 
-        # ✅ Build BiFPN
-        fpn_feature_maps = build_BiFPN(
+        print(f"Length of the backbone feature maps: {len(backbone_feature_maps)}")
+
+        # Build BiFPN
+        self.fpn_feature_maps = build_BiFPN(
             backbone_feature_maps,
-            bifpn_depth=bifpn_depth,
-            bifpn_width=bifpn_width,
-            freeze_bn=freeze_bn
+            bifpn_depth=self.bifpn_depth,
+            bifpn_width=self.bifpn_width,
+            freeze_bn=self.freeze_bn
         )
-    
-        # ✅ Build subnets
-        box_net, class_net, rotation_net, translation_net = build_subnets(
-            num_classes=num_classes,
-            subnet_width=bifpn_width,
-            subnet_depth=subnet_depth,
-            subnet_num_iteration_steps=subnet_num_iteration_steps,
-            num_groups_gn=num_groups_gn,
-            num_rotation_parameters=num_rotation_parameters,
-            freeze_bn=freeze_bn,
-            num_anchors=num_anchors
-        )
-
-        # ✅ Apply subnets to feature maps
-        classification, bbox_regression, rotation, translation, transformation, bboxes = apply_subnets_to_feature_maps(
-            box_net, class_net, rotation_net, translation_net,
-            fpn_feature_maps, input_shape, camera_parameters_input, input_size
-        )
-
-        efficientpose_train = nn.Sequential(
-            box_net,
-            class_net,
-            rotation_net,
-            translation_net
-        )
-
-        # Create FilterDetections module
-        filter_detections = FilterDetections(
-            num_rotation_parameters = num_rotation_parameters,
-            num_translation_parameters = 3,
-            score_threshold = score_threshold 
-        )
-
-        filtered_detections = filter_detections([bboxes, classification, rotation, translation])
         
-        efficientpose_prediction = nn.Sequential(filtered_detections)
+        # Ensure all fpn_feature_maps are on the same device
+        self.fpn_feature_maps = [feature_map.to(device) for feature_map in self.fpn_feature_maps]
 
-        return efficientpose_train, efficientpose_prediction
+        # Apply subnets to feature maps
+        classification, bbox_regression, rotation, translation, bboxes, transformation = apply_subnets_to_feature_maps(
+            self.box_net, self.class_net, self.rotation_net, self.translation_net,
+            self.fpn_feature_maps, image_input, camera_parameters_input, self.input_size
+        )
 
-def _build_backbone_two(phi):
-    """Build the EfficientNet backbone"""
+        if inference:
+            # Apply filtering (e.g., non-max suppression, score thresholding)
+            filtered_detections = self.filter_detections([bboxes, classification, rotation, translation])
+            return filtered_detections
+        else:
+            # Return raw outputs for training.
+            return classification, bbox_regression, transformation
 
-    if phi == 0:
-        from torchvision.models import EfficientNet_B0_Weights
-        backbone = models.efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-    elif phi == 1:
-        from torchvision.models import EfficientNet_B1_Weights
-        backbone = models.efficientnet_b1(weights=EfficientNet_B1_Weights.IMAGENET1K_V1)
-    elif phi == 2:
-        from torchvision.models import EfficientNet_B2_Weights
-        backbone = models.efficientnet_b2(weights=EfficientNet_B2_Weights.IMAGENET1K_V1)
-    elif phi == 3:
-        from torchvision.models import EfficientNet_B3_Weights
-        backbone = models.efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
-    elif phi == 4:
-        from torchvision.models import EfficientNet_B4_Weights
-        backbone = models.efficientnet_b4(weights=EfficientNet_B4_Weights.IMAGENET1K_V1)
-    elif phi == 5:
-        from torchvision.models import EfficientNet_B5_Weights
-        backbone = models.efficientnet_b5(weights=EfficientNet_B5_Weights.IMAGENET1K_V1)
-    elif phi == 6:
-        from torchvision.models import EfficientNet_B6_Weights
-        backbone = models.efficientnet_b6(weights=EfficientNet_B6_Weights.IMAGENET1K_V1)
-
-    # Corrected layer names for feature extraction based on your printed architecture
-    return_nodes = {
-        "features.1": "C1",  # Low-level features
-        "features.2": "C2",  # Mid-level features
-        "features.3": "C3",  # Higher-level features
-        "features.5": "C4",  # Deep features
-        "features.7": "C5"   # Final feature map
-    }
-
-    # Create the feature extractor with the corrected layers
-    feature_extractor = create_feature_extractor(backbone, return_nodes=return_nodes)
-    return feature_extractor
 
 # add main function to test the function
 if __name__ == "__main__":
-    # # Test the function
-
-
     # build_EfficientPose
-    phi = 1  # Select EfficientNet-B2
+    phi = 0  # Select EfficientNet-B2
     num_rotation_parameters = 3
     num_classes = 1
     num_anchors = 9
@@ -1764,14 +1664,15 @@ if __name__ == "__main__":
     score_threshold = 0.7
     model = BuildEfficientPoseModel(phi, num_classes, num_anchors, freeze_bn, score_threshold, num_rotation_parameters)
 
-    # Print feature maps in TensorFlow-like format
-    print("\nBiFPN feature maps shape:")
-    for i, fm in enumerate(model.fpn_feature_maps):
-        print(f"Tensor(\"FPN{i+1}\", shape={tuple(fm.shape)}, dtype=float32)")
+    # For training (raw outputs used in loss computations)
+    outputs = model(model.input_shape, model.camera_parameters_input, inference=False)
 
+    print("========================================>")
 
-    # efficientpose_train, efficientpose_prediction = build_EfficientPose(phi, num_classes, num_anchors, freeze_bn, score_threshold, num_rotation_parameters)
+    # For validation/inference (filtered detections)
+    predictions = model(model.input_shape, model.camera_parameters_input, inference=True)
 
-
-
-
+    if model.fpn_feature_maps:
+        print("\nBiFPN feature maps shape:")
+        for i, fm in enumerate(model.fpn_feature_maps):
+            print(f"Tensor(\"FPN{i+1}\", shape={tuple(fm.shape)}, dtype=float32)")
