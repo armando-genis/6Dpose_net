@@ -1468,10 +1468,12 @@ def apply_subnets_to_feature_maps(box_net, class_net, rotation_net, translation_
     print(f"Translation raw shape: {translation_raw.shape}")
 
     anchors, translation_anchors = anchors_for_shape((input_size, input_size), anchor_params=anchor_parameters)
-    translation_anchors_input = translation_anchors.unsqueeze(0)
-
+    
+    device = image_input.device
+    anchors = anchors.to(device)
+    translation_anchors = translation_anchors.to(device)
+    translation_anchors_input = translation_anchors.unsqueeze(0)  # Now on the same device
     print(f"Anchors shape: {anchors.shape}")
-
     print(f"Translation anchors shape: {translation_anchors_input.shape}")
 
     # Apply regression to translation anchors
