@@ -1473,6 +1473,7 @@ def apply_subnets_to_feature_maps(box_net, class_net, rotation_net, translation_
     anchors = anchors.to(device)
     translation_anchors = translation_anchors.to(device)
     translation_anchors_input = translation_anchors.unsqueeze(0)  # Now on the same device
+
     print(f"Anchors shape: {anchors.shape}")
     print(f"Translation anchors shape: {translation_anchors_input.shape}")
 
@@ -1493,28 +1494,28 @@ def apply_subnets_to_feature_maps(box_net, class_net, rotation_net, translation_
         image_scale=camera_parameters[:, 5]
     )
 
-    print(f"Translation shape: {translation.shape}")
+    # print(f"Translation shape: {translation.shape}")
 
     anchors_tensor = anchors.unsqueeze(0).to(translation_raw.device)
 
-    print(f"Anchors tensor shape: {anchors_tensor.shape}")
+    # print(f"Anchors tensor shape: {anchors_tensor.shape}")
 
     # Apply regression to get predicted bounding boxes
     regress_boxes = RegressBoxes()
     bboxes = regress_boxes([anchors_tensor, bbox_regression[..., :4]])
 
-    print(f"Bboxes shape: {bboxes.shape}")
+    # print(f"Bboxes shape: {bboxes.shape}")
 
     # Clip bounding boxes to image boundaries
     clip_boxes = ClipBoxes()
     bboxes = clip_boxes([image_input, bboxes])
 
-    print(f"Clipped bboxes shape: {bboxes.shape}")
+    # print(f"Clipped bboxes shape: {bboxes.shape}")
 
     # Concatenate rotation and translation outputs to transformation output
     transformation = torch.cat([rotation, translation], dim=-1)
 
-    print(f"Transformation shape: {transformation.shape}")
+    # print(f"Transformation shape: {transformation.shape}")
 
     return classification, bbox_regression, rotation, translation, bboxes, transformation
 
@@ -1627,7 +1628,7 @@ class BuildEfficientPoseModel(nn.Module):
         features = self.feature_extractor(image_input)  # Extract features as a dictionary
         backbone_feature_maps = [features[node_name] for node_name in ["C1", "C2", "C3", "C4", "C5"]]
 
-        print(f"Length of the backbone feature maps: {len(backbone_feature_maps)}")
+        # print(f"Length of the backbone feature maps: {len(backbone_feature_maps)}")
 
         # Build BiFPN
         self.fpn_feature_maps = build_BiFPN(
@@ -1666,15 +1667,22 @@ if __name__ == "__main__":
     score_threshold = 0.7
     model = BuildEfficientPoseModel(phi, num_classes, num_anchors, freeze_bn, score_threshold, num_rotation_parameters)
 
+    # Image input shape: torch.Size([1, 3, 512, 512])
+    # Camera parameters input shape: torch.Size([1, 6])
+    input_image_shape = torch.randn(1, 3, 512, 512)
+    camera_parameters_shape = torch.randn(1, 6)
+
     # For training (raw outputs used in loss computations)
-    outputs = model(model.input_shape, model.camera_parameters_input, inference=False)
+    classification, bbox_regression, transformation = model(input_image_shape, camera_parameters_shape, inference=False)
+
+    print("Classification shape:", classification.shape)
 
     print("========================================>")
 
     # For validation/inference (filtered detections)
-    predictions = model(model.input_shape, model.camera_parameters_input, inference=True)
+    # predictions = model(model.input_shape, model.camera_parameters_input, inference=True)
 
-    if model.fpn_feature_maps:
-        print("\nBiFPN feature maps shape:")
-        for i, fm in enumerate(model.fpn_feature_maps):
-            print(f"Tensor(\"FPN{i+1}\", shape={tuple(fm.shape)}, dtype=float32)")
+    # if model.fpn_feature_maps:
+    #     print("\nBiFPN feature maps shape:")
+    #     for i, fm in enumerate(model.fpn_feature_maps):
+    #         print(f"Tensor(\"FPN{i+1}\", shape={tuple(fm.shape)}, dtype=float32)")

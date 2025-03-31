@@ -27,7 +27,7 @@ class AnchorParameters(torch.nn.Module):
         self.sizes = sizes
         self.strides = strides
         self.ratios = torch.tensor(ratios, dtype=torch.float32)
-        self.scales = torch.tensor(ratios, dtype=torch.float32)
+        self.scales = torch.tensor(scales, dtype=torch.float32)
 
     def num_anchors(self):
         return len(self.ratios) * len(self.scales)

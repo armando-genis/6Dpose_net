@@ -6,8 +6,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from model import BuildEfficientPoseModel
-from losses import smooth_l1, focal, transformation_loss
+from losses import focal, smooth_l1, transformation_loss
 import json
+from utils.visualization import draw_detections, draw_annotations
+import cv2
+import math
+from tqdm import tqdm
+import numpy as np
 
 def parse_args(args):
     """
@@ -41,7 +46,7 @@ def parse_args(args):
     parser.add_argument('--phi', help = 'Hyper parameter phi', default = 0, type = int, choices = (0, 1, 2, 3, 4, 5, 6))
     parser.add_argument('--gpu', help = 'Id of the GPU to use (as reported by nvidia-smi).')
     parser.add_argument('--epochs', help = 'Number of epochs to train.', type = int, default = 500)
-    parser.add_argument('--steps', help = 'Number of steps per epoch.', type = int, default = int(150 * 10))
+    parser.add_argument('--steps', help = 'Number of steps per epoch.', type = int, default = int(179 * 10))
     parser.add_argument('--snapshot-path', help = 'Path to store snapshots of models during training', default = os.path.join("checkpoints", date_and_time))
     parser.add_argument('--tensorboard-dir', help = 'Log directory for Tensorboard output', default = os.path.join("logs", date_and_time))
     parser.add_argument('--no-snapshots', help = 'Disable saving snapshots.', dest = 'snapshots', action = 'store_false')
@@ -89,21 +94,9 @@ def main(args = None):
 
     print(f"Total number of items in train_gen: {len(train_generator)}")
 
-    for i in range(min(15, len(train_generator))):
-        img_components, anno = train_generator[i]
-        
-        print(f"\nItem {i}:")
-        print("  Image components:")
-        for j, component in enumerate(img_components):
-            print(f"    Component {j} shape:", component.shape)
 
-    #output
-    # Item 13:
-    # Image components:
-    #     Component 0 shape: (1, 512, 512, 3) # RGB image_input
-    #     Component 1 shape: (1, 6) # camera_parameters_input 
-        
 
+    
 
     # create the model
     # --- Build the Model ---
@@ -136,9 +129,256 @@ def main(args = None):
         for param in model.feature_extractor.parameters():
             param.requires_grad = False
 
+    # Start training
+    train(
+        model=model,
+        train_generator=train_generator,
+        val_generator=validation_generator,
+        args=args,
+        device=device, 
+        num_rotation_parameters=num_rotation_parameters
+    )
 
 
+def train(model, train_generator, val_generator, args, device=None, num_rotation_parameters=None):
 
+
+    model_3d_points_np = train_generator.get_all_3d_model_points_array_for_loss()
+
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    print("Optimizer:", optimizer)
+
+    # Instantiate loss functions from losses.py.
+    focal_loss = focal()      # Focal loss functor.
+    smooth_l1_loss = smooth_l1()  # Smooth L1 loss functor
+    trans_loss = transformation_loss(model_3d_points_np, num_rotation_parameters)
+    loss_weights = {'regression': 1.0, 'classification': 1.0, 'transformation': 0.02}
+
+
+    for epoch in range(args.epochs):
+        model.train()
+
+        # Reset metrics
+        total_loss = 0.0
+        total_cls_loss = 0.0
+        total_reg_loss = 0.0
+        total_transf_loss = 0.0
+
+        for step in range(args.steps):
+            img_components, annotations = train_generator[step % len(train_generator)]
+            image_input = torch.from_numpy(img_components[0]).permute(0, 3, 1, 2).float().to(device)
+            camera_input = torch.from_numpy(img_components[1]).float().to(device)
+
+            # print("\nStep:", step)
+            # print("Image input shape:", image_input.shape)
+            # print("Camera input shape:", camera_input.shape)
+
+            classification_targets = torch.from_numpy(annotations[0]).float().squeeze(0).to(device)
+            classification_targets = classification_targets.unsqueeze(0)
+            regression_targets     = torch.from_numpy(annotations[1]).float().squeeze(0).to(device)
+            regression_targets     = regression_targets.unsqueeze(0)
+            transformation_targets = torch.from_numpy(annotations[2]).float().squeeze(0).to(device)
+            transformation_targets = transformation_targets.unsqueeze(0)
+
+
+            # print("Classification targets shape:", classification_targets.shape)
+            # print("Regression targets shape:", regression_targets.shape)
+            # print("Transformation targets shape:", transformation_targets.shape)
+
+            # Forward pass
+            classification, bbox_regression, transformation = model(image_input, camera_input)
+
+            # print("Classification shape:", classification.shape)
+            # print("Bbox regression shape:", bbox_regression.shape)
+            # print("Transformation shape:", transformation.shape)
+
+            cls_loss = focal_loss(classification_targets, classification)
+            reg_loss = smooth_l1_loss(regression_targets, bbox_regression)
+            transformation_loss_val = trans_loss(transformation_targets, transformation)
+
+            # print("-----> Classification loss:", cls_loss)
+            # print("-----> Regression loss:", reg_loss)
+            # print("-----> Transformation loss:", transformation_loss_val)
+
+            # Total weighted loss
+            loss = (loss_weights['classification'] * cls_loss + 
+                    loss_weights['regression'] * reg_loss +
+                    loss_weights['transformation'] * transformation_loss_val)
+            
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping (same as in Keras version)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.001)
+            
+            optimizer.step()
+            
+            # Update metrics
+            total_loss += loss.item()
+            total_cls_loss += cls_loss.item()
+            total_reg_loss += reg_loss.item()
+            total_transf_loss += transformation_loss_val.item()
+            
+            # Print progress every 10 steps
+            if (step + 1) % 10 == 0:
+                print(f"Step: {step+1}/{args.steps} - Loss: {loss.item():.4f}, "
+                      f"Cls: {cls_loss.item():.4f}, Reg: {reg_loss.item():.4f}, "
+                      f"Trans: {transformation_loss_val.item():.4f}")
+        
+        # Epoch summary
+        avg_loss = total_loss / args.steps
+        avg_cls_loss = total_cls_loss / args.steps
+        avg_reg_loss = total_reg_loss / args.steps
+        avg_trans_loss = total_transf_loss / args.steps
+        
+        print(f"Training - Loss: {avg_loss:.4f}, Cls: {avg_cls_loss:.4f}, "
+              f"Reg: {avg_reg_loss:.4f}, Trans: {avg_trans_loss:.4f}")
+
+
+        # Validation
+        if val_generator is not None:
+            model.eval()
+
+
+            if args.validation_image_save_path:
+                if args.dataset_type == 'linemod':
+                    save_path = os.path.join(args.validation_image_save_path, f"object_{args.object_id}", f"epoch_{epoch+1}")
+                else:
+                    save_path = os.path.join(args.validation_image_save_path, f"epoch_{epoch+1}")
+                
+                os.makedirs(save_path, exist_ok=True)
+            else:
+                save_path = None
+
+                
+            validate_model(
+                model, val_generator, focal_loss, smooth_l1_loss, trans_loss,
+                loss_weights, device, args, epoch=epoch, save_path=save_path, 
+            )
+            
+
+def validate_model(model, val_generator, focal_loss, smooth_l1_loss, trans_loss, 
+                   loss_weights, device, args, epoch=0, save_path=None, score_threshold=0.1):
+    """
+    Validate the model on validation data.
+    """
+    model.eval()  # Set model to evaluation mode
+    max_detections=50
+    detection_count = 0
+    # Process each image in the validation generator
+    for i in tqdm(range(len(val_generator)), desc='Running detection network'):
+        # Load and preprocess image
+        raw_image = val_generator.load_image(i)
+        image, scale = val_generator.preprocess_image(raw_image.copy())
+        camera_matrix = val_generator.load_camera_matrix(i)
+        camera_input = val_generator.get_camera_parameter_input(camera_matrix, scale, val_generator.translation_scale_norm)
+        
+        # Convert to PyTorch tensors and move to device
+        image_tensor = torch.from_numpy(np.expand_dims(image, axis=0)).permute(0, 3, 1, 2).float().to(device)
+        camera_tensor = torch.from_numpy(np.expand_dims(camera_input, axis=0)).float().to(device)
+
+        # print("Image tensor shape:", image_tensor.shape)
+        # print("Camera tensor shape:", camera_tensor.shape)
+
+        detections = model(image_tensor, camera_tensor, inference=True)
+
+        # Extract outputs from the model
+        boxes = detections[0][0].cpu().numpy().astype(np.float32)  # Convert to float32
+        scores = detections[1][0].cpu().numpy()
+        labels = detections[2][0].cpu().numpy().astype(int)
+        rotations = detections[3][0].cpu().numpy().astype(np.float32)  # Convert to float32 here
+        translations = detections[4][0].cpu().numpy()
+
+        # Now these will work without errors
+        boxes /= scale
+        rotations *= math.pi
+        
+        # Select indices which have a score above the threshold
+        indices = np.where(scores > score_threshold)[0]
+
+        detection_count += len(indices)
+        
+        # Select those scores
+        scores = scores[indices]
+                
+        # No detections above threshold
+        if len(scores) == 0:
+            # Create empty arrays with correct shapes
+            image_boxes = np.zeros((0, 4))
+            image_rotations = np.zeros((0, rotations.shape[1]))
+            image_translations = np.zeros((0, translations.shape[1]))
+            image_scores = np.zeros((0,))
+            image_labels = np.zeros((0,), dtype=np.int32)
+            image_detections = np.zeros((0, 6))  # 4 + 1 + 1 (box, score, label)
+        else:
+            # Find the order with which to sort the scores
+            scores_sort = np.argsort(-scores)[:max_detections]
+            
+            # Select detections
+            image_boxes = boxes[indices[scores_sort], :]
+            image_rotations = rotations[indices[scores_sort], :]
+            image_translations = translations[indices[scores_sort], :]
+            image_scores = scores[scores_sort]
+            image_labels = labels[indices[scores_sort]]
+            
+            # Concatenate for storage
+            image_detections = np.concatenate([
+                image_boxes, 
+                np.expand_dims(image_scores, axis=1), 
+                np.expand_dims(image_labels, axis=1)
+            ], axis=1)
+
+        # Save visualization if requested
+        if save_path is not None:
+            try:
+                # Make a copy and convert to BGR for OpenCV
+                if raw_image.shape[2] == 3:  # RGB image
+                    vis_image = cv2.cvtColor(raw_image.copy(), cv2.COLOR_RGB2BGR)
+                else:
+                    vis_image = raw_image.copy()
+                
+                # Draw ground truth annotations
+                from utils.visualization import draw_annotations
+                draw_annotations(
+                    vis_image, 
+                    val_generator.load_annotations(i), 
+                    class_to_bbox_3D=val_generator.get_bbox_3d_dict(), 
+                    camera_matrix=camera_matrix, 
+                    label_to_name=val_generator.label_to_name
+                )
+                
+                # Draw detections if any were found
+                if len(image_boxes) > 0:
+                    from utils.visualization import draw_detections
+                    draw_detections(
+                        vis_image, 
+                        image_boxes, 
+                        image_scores, 
+                        image_labels, 
+                        image_rotations, 
+                        image_translations, 
+                        class_to_bbox_3D=val_generator.get_bbox_3d_dict(), 
+                        camera_matrix=camera_matrix, 
+                        label_to_name=val_generator.label_to_name
+                    )
+                else:
+                    print(f"No detections found for image {i}")
+                
+                # Ensure directory exists
+                os.makedirs(save_path, exist_ok=True)
+                
+                # Save the visualization
+                img_save_path = os.path.join(save_path, f'epoch_{epoch}_img_{i}.jpg')
+                cv2.imwrite(img_save_path, vis_image)
+                
+            except Exception as e:
+                print(f"Error saving visualization for image {i}: {str(e)}")
+
+    print(f"Total detections across all images: {detection_count}")
+
+def calculate_pose_metrics(predictions, ground_truths, val_generator):
+    print("Calculating pose metrics...")
 
 
 
@@ -187,3 +427,4 @@ def create_generators(args):
 
 if __name__ == '__main__':
     main()
+
