@@ -1,13 +1,6 @@
 """
 EfficientPose (c) by Steinbeis GmbH & Co. KG für Technologietransfer
-Haus der Wirtschaft, Willi-Bleicher-Straße 19, 70174 Stuttgart, Germany
-Yannick Bukschat: yannick.bukschat@stw.de
-Marcus Vetter: marcus.vetter@stw.de
-
-EfficientPose is licensed under a
-Creative Commons Attribution-NonCommercial 4.0 International License.
-
-NumPy 2.x compatibility patch added.
+Enhanced NumPy 2.x compatibility patch that also fixes np.bool issues.
 """
 
 import numpy as np
@@ -17,7 +10,62 @@ import importlib
 import shutil
 import re
 
-# Patch imgaug before importing it
+# Patch imgaug meta.py to fix np.bool issues
+def patch_imgaug_meta_for_numpy2():
+    """
+    Apply patches to meta.py to fix np.bool issues
+    Returns True if successful, False otherwise
+    """
+    try:
+        # Find imgaug module
+        import importlib.util
+        spec = importlib.util.find_spec('imgaug')
+        if spec is None:
+            print("Error: imgaug module not found")
+            return False
+            
+        imgaug_dir = os.path.dirname(spec.origin)
+        meta_path = os.path.join(imgaug_dir, "augmenters", "meta.py")
+        
+        if not os.path.exists(meta_path):
+            print(f"Error: Cannot find meta.py at {meta_path}")
+            return False
+            
+        # Create backup if it doesn't exist
+        backup_path = meta_path + ".bak"
+        if not os.path.exists(backup_path):
+            shutil.copy2(meta_path, backup_path)
+            print(f"Created backup at {backup_path}")
+            
+        # Read the file
+        with open(meta_path, 'r') as f:
+            content = f.read()
+            
+        # Check if already patched
+        if 'dtype=np.bool' not in content:
+            print("meta.py already patched for np.bool or doesn't contain the problematic code")
+            return True
+            
+        # Replace np.bool with bool
+        content = content.replace('dtype=np.bool', 'dtype=bool')
+        
+        # Write the patched file
+        with open(meta_path, 'w') as f:
+            f.write(content)
+            
+        print("Successfully patched imgaug meta.py for NumPy 2.x compatibility")
+        
+        # Reload the module if it's already loaded
+        if 'imgaug.augmenters.meta' in sys.modules:
+            print("Reloading imgaug.augmenters.meta module...")
+            importlib.reload(sys.modules['imgaug.augmenters.meta'])
+            
+        return True
+    except Exception as e:
+        print(f"Error patching imgaug meta.py: {e}")
+        return False
+
+# Patch imgaug before importing it (original function from your code)
 def patch_imgaug_for_numpy2():
     """
     Apply patches to make imgaug work with NumPy 2.x
@@ -117,10 +165,23 @@ def patch_imgaug_for_numpy2():
         print(f"Error patching imgaug: {e}")
         return False
 
-# Apply the patch before importing any imgaug components
-success = patch_imgaug_for_numpy2()
-if not success:
-    print("WARNING: Failed to patch imgaug. RandAugment may not work correctly with NumPy 2.x")
+def apply_monkey_patch():
+    """
+    Apply a monkey patch for np.bool if needed.
+    This is a fallback if direct file patching fails.
+    """
+    if not hasattr(np, 'bool'):
+        print("Applying monkey patch: Setting np.bool = bool")
+        np.bool = bool
+    return True
+
+# Apply all patches before importing any imgaug components
+print("Applying NumPy 2.x compatibility patches to imgaug...")
+success_main = patch_imgaug_for_numpy2()
+success_meta = patch_imgaug_meta_for_numpy2()
+if not (success_main and success_meta):
+    print("WARNING: Direct patching failed. Applying monkey patch as fallback...")
+    apply_monkey_patch()
 
 # Now it's safe to import imgaug components
 try:
@@ -130,6 +191,8 @@ try:
     from imgaug.augmenters import arithmetic
     from imgaug.augmenters import pillike
     import imgaug.augmenters as iaa
+    
+    print("Successfully imported imgaug components after patching")
 except ImportError as e:
     print(f"Error importing imgaug: {e}")
     # Create dummy classes/functions to avoid errors when importing this module
@@ -280,7 +343,7 @@ else:
         def get_parameters(self):
             """See :func:`~imgaug.augmenters.meta.Augmenter.get_parameters`."""
             try:
-                someof = self[1]
+                someof = self[0]
                 return [someof.n, self._m, self._cval]
             except Exception as e:
                 print(f"Warning: Error in get_parameters: {e}")

@@ -1,6 +1,3 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Force CPU only
-
 
 import argparse
 import time
@@ -12,7 +9,13 @@ from tensorflow import keras
 from tensorflow.keras.optimizers import Adam
 from generator.linemod import LineModGenerator
 from custom_load_weights import custom_load_weights
-from model import build_EfficientPose
+
+
+# models
+# from model import build_EfficientPose
+# from modeltest import build_EfficientPose
+from model_rotation import build_EfficientPose
+
 from losses import smooth_l1, focal, transformation_loss
 from eval.eval_callback import Evaluate
 
@@ -144,7 +147,7 @@ def main(args = None):
         for j, component in enumerate(target):  
             print(f"    Target {j} shape:", component.shape)
 
-    train_dataset = convert_generator_to_dataset(train_generator)
+    train_dataset = convert_generator_to_dataset(train_generator).repeat()
     validation_dataset = convert_generator_to_dataset(validation_generator)
     
     # optionally choose specific GPU
@@ -263,7 +266,7 @@ def create_callbacks(training_model, prediction_model, validation_generator, arg
         os.makedirs(snapshot_path, exist_ok = True)
         checkpoint = keras.callbacks.ModelCheckpoint(os.path.join(snapshot_path, 'phi_{phi}_{dataset_type}_best_{metric}.h5'.format(phi = str(args.phi), metric = metric_to_monitor, dataset_type = args.dataset_type)),
                                                      verbose = 1,
-                                                     #save_weights_only = True,
+                                                     save_weights_only = True,
                                                      save_best_only = True,
                                                      monitor = metric_to_monitor,
                                                      mode = mode)

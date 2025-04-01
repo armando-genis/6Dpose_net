@@ -22,16 +22,20 @@ RUN apt-get update && \
     echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /" > /etc/apt/sources.list.d/cuda.list && \
     apt-get update
 
-# Install CUDA and NVIDIA-related dependencies
-RUN apt-get update && \
-    apt-get install -y --allow-change-held-packages \
-    cuda-toolkit-12-1 \
-    libcudnn8 \
-    libcudnn8-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 # Remove any potential duplicate CUDA repository entries
 RUN rm -f /etc/apt/sources.list.d/cuda-ubuntu2204-x86_64.list
+
+# Install CUDA toolkit without specific cudnn version constraints
+RUN apt-get update && \
+    apt-get install -y --allow-change-held-packages \
+    cuda-toolkit-12-1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Add NVIDIA repository for cuDNN
+RUN curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-ubuntu2204.pin -o /etc/apt/preferences.d/cuda-repository-pin-600 && \
+    apt-get update && \
+    apt-get install -y --allow-change-held-packages libcudnn8 libcudnn8-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 # Set up CUDA environment variables
 ENV PATH=/usr/local/cuda/bin:${PATH}
@@ -65,6 +69,9 @@ RUN apt-get update -qq && \
 
 # Install PyTorch, TorchVision, and Torchaudio
 RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install TensorFlow 2.19
+RUN pip3 install tensorflow==2.15.0
 
 # Set up zsh with Oh My Zsh
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended && \

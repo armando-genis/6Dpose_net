@@ -1,28 +1,3 @@
-"""
-EfficientPose (c) by Steinbeis GmbH & Co. KG für Technologietransfer
-Haus der Wirtschaft, Willi-Bleicher-Straße 19, 70174 Stuttgart, Germany
-Yannick Bukschat: yannick.bukschat@stw.de
-Marcus Vetter: marcus.vetter@stw.de
-
-EfficientPose is licensed under a
-Creative Commons Attribution-NonCommercial 4.0 International License.
-
-The license can be found in the LICENSE file in the root directory of this source tree
-or at http://creativecommons.org/licenses/by-nc/4.0/.
----------------------------------------------------------------------------------------------------------------------------------
----------------------------------------------------------------------------------------------------------------------------------
-
-Based on:
-
-Keras EfficientDet implementation (https://github.com/xuannianz/EfficientDet) licensed under the Apache License, Version 2.0
----------------------------------------------------------------------------------------------------------------------------------
-The official EfficientDet implementation (https://github.com/google/automl) licensed under the Apache License, Version 2.0
----------------------------------------------------------------------------------------------------------------------------------
-EfficientNet Keras implementation (https://github.com/qubvel/efficientnet) licensed under the Apache License, Version 2.0
----------------------------------------------------------------------------------------------------------------------------------
-Keras RetinaNet implementation (https://github.com/fizyr/keras-retinanet) licensed under the Apache License, Version 2.0
-"""
-
 # import keras
 from tensorflow import keras
 import tensorflow as tf
@@ -759,3 +734,172 @@ class GroupNormalization(tf.keras.layers.Layer):
         broadcast_shape[self.axis] = input_shape[self.axis] // self.groups
         broadcast_shape.insert(self.axis, self.groups)
         return broadcast_shape
+    
+
+class EnhancedBiFPNAdd(keras.layers.Layer):
+    """
+    Enhanced layer that computes a weighted sum of BiFPN feature maps using softmax normalization
+    """
+    def __init__(self, epsilon=1e-4, use_softmax=True, **kwargs):
+        super(EnhancedBiFPNAdd, self).__init__(**kwargs)
+        self.epsilon = epsilon
+        self.use_softmax = use_softmax
+
+    def build(self, input_shape):
+        num_in = len(input_shape)
+        self.w = self.add_weight(name=self.name,
+                                shape=(num_in,),
+                                initializer=keras.initializers.constant(1.0),
+                                trainable=True,
+                                dtype=tf.float32)
+        
+        # Optional scale parameter for each level
+        self.scale = self.add_weight(name=f'{self.name}_scale',
+                                    shape=(1,),
+                                    initializer=keras.initializers.constant(1.0),
+                                    trainable=True,
+                                    dtype=tf.float32)
+
+    def call(self, inputs, **kwargs):
+        if self.use_softmax:
+            w = tf.nn.softmax(self.w)
+        else:
+            w = keras.activations.relu(self.w)
+            w = w / (tf.reduce_sum(w) + self.epsilon)
+            
+        x = tf.reduce_sum([w[i] * inputs[i] for i in range(len(inputs))], axis=0)
+        
+        # Apply scaling factor
+        x = x * self.scale
+        
+        return x
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0]
+
+    def get_config(self):
+        config = super(EnhancedBiFPNAdd, self).get_config()
+        config.update({
+            'epsilon': self.epsilon,
+            'use_softmax': self.use_softmax
+        })
+        return config
+    
+
+class SpatialAttentionModule(keras.layers.Layer):
+    """
+    Spatial attention module that helps the model focus on relevant spatial locations
+    """
+    def __init__(self, kernel_size=7, **kwargs):
+        super(SpatialAttentionModule, self).__init__(**kwargs)
+        self.kernel_size = kernel_size
+        
+    def build(self, input_shape):
+        self.conv = keras.layers.Conv2D(
+            filters=1,
+            kernel_size=self.kernel_size,
+            padding='same',
+            activation='sigmoid',
+            kernel_initializer='he_normal',
+            use_bias=False,
+            name=f'{self.name}_conv'
+        )
+        super(SpatialAttentionModule, self).build(input_shape)
+        
+    def call(self, inputs, **kwargs):
+        # Channel-wise attention: compute avg and max along channel axis
+        avg_pool = keras.backend.mean(inputs, axis=-1, keepdims=True)
+        max_pool = keras.backend.max(inputs, axis=-1, keepdims=True)
+        
+        # Concatenate along the channel axis
+        concat = keras.layers.concatenate([avg_pool, max_pool])
+        
+        # Generate spatial attention map
+        attention_map = self.conv(concat)
+        
+        # Apply attention
+        return inputs * attention_map
+    
+    def get_config(self):
+        config = super(SpatialAttentionModule, self).get_config()
+        config.update({'kernel_size': self.kernel_size})
+        return config
+    
+class RotationAttentionModule(keras.layers.Layer):
+    """
+    Attention module specifically designed to emphasize features relevant for rotation estimation.
+    """
+    def __init__(self, filters=64, kernel_size=3, **kwargs):
+        super(RotationAttentionModule, self).__init__(**kwargs)
+        self.filters = filters
+        self.kernel_size = kernel_size
+        
+    def build(self, input_shape):
+        # Channel attention branch
+        self.channel_avg_pool = keras.layers.GlobalAveragePooling2D()
+        self.channel_max_pool = keras.layers.GlobalMaxPooling2D()
+        
+        self.channel_shared_mlp = keras.Sequential([
+            keras.layers.Dense(input_shape[-1] // 4, activation='relu'),
+            keras.layers.Dense(input_shape[-1])
+        ])
+        
+        # Directional feature extraction
+        self.dir_conv_h = keras.layers.Conv2D(
+            self.filters, (1, self.kernel_size), padding='same', activation=None
+        )
+        self.dir_conv_v = keras.layers.Conv2D(
+            self.filters, (self.kernel_size, 1), padding='same', activation=None
+        )
+        self.dir_conv_d1 = keras.layers.Conv2D(
+            self.filters, (self.kernel_size, self.kernel_size), padding='same', activation=None
+        )
+        self.dir_conv_d2 = keras.layers.Conv2D(
+            self.filters, (self.kernel_size, self.kernel_size), padding='same', activation=None
+        )
+        
+        # Fusion layer
+        self.fusion_conv = keras.layers.Conv2D(
+            1, 1, padding='same', activation='sigmoid'
+        )
+        
+        super(RotationAttentionModule, self).build(input_shape)
+        
+    def call(self, inputs, **kwargs):
+        # Channel attention
+        avg_pool = self.channel_avg_pool(inputs)
+        max_pool = self.channel_max_pool(inputs)
+        
+        avg_channel_attention = self.channel_shared_mlp(avg_pool)
+        max_channel_attention = self.channel_shared_mlp(max_pool)
+        
+        channel_attention = keras.activations.sigmoid(avg_channel_attention + max_channel_attention)
+        channel_attention = tf.reshape(channel_attention, [-1, 1, 1, inputs.shape[-1]])
+        
+        channel_refined = inputs * channel_attention
+        
+        # Directional feature extraction (detects orientation-sensitive patterns)
+        dir_h = self.dir_conv_h(channel_refined)
+        dir_v = self.dir_conv_v(channel_refined)
+        dir_d1 = self.dir_conv_d1(channel_refined)
+        dir_d2 = self.dir_conv_d2(channel_refined)
+        
+        # Combine directional features
+        dir_combined = tf.concat([dir_h, dir_v, dir_d1, dir_d2], axis=-1)
+        dir_combined = tf.nn.relu(dir_combined)
+        
+        # Generate spatial attention map focused on rotation-relevant features
+        spatial_attention = self.fusion_conv(dir_combined)
+        
+        # Apply attention to input features
+        refined_features = inputs * spatial_attention
+        
+        return refined_features
+    
+    def get_config(self):
+        config = super(RotationAttentionModule, self).get_config()
+        config.update({
+            'filters': self.filters,
+            'kernel_size': self.kernel_size
+        })
+        return config

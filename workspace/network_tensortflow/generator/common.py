@@ -752,8 +752,8 @@ class Generator(keras.utils.Sequence):
             reshaped_rot_mat = np.reshape(rotation_matrix, newshape = (3, 3))
             return self.rotation_mat_to_axis_angle(reshaped_rot_mat)
         elif rotation_representation == "quaternion":
-            print("Error: quaternion representation is currently not supported.")
-            return None
+            reshaped_rot_mat = np.reshape(rotation_matrix, (3, 3))
+            return self.rotation_mat_to_quaternion(reshaped_rot_mat)
         else:
             print("Error: Unkown rotation representation {}".format(rotation_representation))
             return None
@@ -863,3 +863,100 @@ class Generator(keras.utils.Sequence):
         Load annotations for an image_index.
         """
         raise NotImplementedError('load_annotations method not implemented')
+    
+
+    def add_random_occlusions(self, image, mask, num_occlusions=2, occlusion_size_range=(0.1, 0.4)):
+        """
+        Adds random rectangular occlusions to the image.
+        
+        Args:
+            image: The image to augment
+            mask: The segmentation mask
+            num_occlusions: Number of occlusions to add
+            occlusion_size_range: Range of occlusion sizes relative to object size
+            
+        Returns:
+            augmented_image: Image with synthetic occlusions
+        """
+        augmented_image = image.copy()
+        height, width = image.shape[:2]
+        
+        # Only add occlusions where objects exist (using mask)
+        object_pixels = np.where(mask > 0)
+        if len(object_pixels[0]) == 0:  # No objects in mask
+            return augmented_image
+        
+        # Calculate bounding box of all objects
+        y_min, y_max = np.min(object_pixels[0]), np.max(object_pixels[0])
+        x_min, x_max = np.min(object_pixels[1]), np.max(object_pixels[1])
+        
+        obj_height = y_max - y_min
+        obj_width = x_max - x_min
+        
+        for _ in range(num_occlusions):
+            # Random occlusion size
+            occlusion_height = int(obj_height * random.uniform(*occlusion_size_range))
+            occlusion_width = int(obj_width * random.uniform(*occlusion_size_range))
+            
+            # Random position near or on the object
+            center_y = random.randint(y_min, y_max)
+            center_x = random.randint(x_min, x_max)
+            
+            # Calculate occlusion rectangle coordinates
+            y1 = max(0, center_y - occlusion_height // 2)
+            y2 = min(height, center_y + occlusion_height // 2)
+            x1 = max(0, center_x - occlusion_width // 2)
+            x2 = min(width, center_x + occlusion_width // 2)
+            
+            # Create the occlusion with a random color or noise pattern
+            if random.random() > 0.5:
+                # Solid color occlusion
+                color = np.random.randint(0, 255, 3)
+                augmented_image[y1:y2, x1:x2] = color
+            else:
+                # Noise pattern
+                noise = np.random.randint(0, 255, (y2-y1, x2-x1, 3), dtype=np.uint8)
+                augmented_image[y1:y2, x1:x2] = noise
+        
+        return augmented_image
+    
+    def rotation_mat_to_quaternion(R):
+        """
+        Converts a 3x3 rotation matrix to a quaternion.
+        
+        Args:
+            R: numpy array of shape (3, 3) representing the rotation matrix.
+            
+        Returns:
+            A numpy array of shape (4,) representing the unit quaternion in the order (w, x, y, z).
+        """
+        trace = R[0, 0] + R[1, 1] + R[2, 2]
+        if trace > 0:
+            s = math.sqrt(trace + 1.0) * 2.0  # s = 4 * qw
+            qw = 0.25 * s
+            qx = (R[2, 1] - R[1, 2]) / s
+            qy = (R[0, 2] - R[2, 0]) / s
+            qz = (R[1, 0] - R[0, 1]) / s
+        elif (R[0, 0] > R[1, 1]) and (R[0, 0] > R[2, 2]):
+            s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0  # s = 4 * qx
+            qw = (R[2, 1] - R[1, 2]) / s
+            qx = 0.25 * s
+            qy = (R[0, 1] + R[1, 0]) / s
+            qz = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0  # s = 4 * qy
+            qw = (R[0, 2] - R[2, 0]) / s
+            qx = (R[0, 1] + R[1, 0]) / s
+            qy = 0.25 * s
+            qz = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0  # s = 4 * qz
+            qw = (R[1, 0] - R[0, 1]) / s
+            qx = (R[0, 2] + R[2, 0]) / s
+            qy = (R[1, 2] + R[2, 1]) / s
+            qz = 0.25 * s
+            
+        q = np.array([qw, qx, qy, qz], dtype=np.float32)
+        # Normalize the quaternion to ensure it's a unit quaternion
+        q = q / np.linalg.norm(q)
+        return q
