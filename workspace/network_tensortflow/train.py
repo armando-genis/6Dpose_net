@@ -14,7 +14,7 @@ from custom_load_weights import custom_load_weights
 # models
 # from model import build_EfficientPose
 # from modeltest import build_EfficientPose
-from model_rotation import build_EfficientPose
+from modelrotation import build_EfficientPose
 
 from losses import smooth_l1, focal, transformation_loss
 from eval.eval_callback import Evaluate
@@ -137,15 +137,15 @@ def main(args = None):
 
     print(f"Total number of items in train_gen: {len(train_generator)}")
 
-    for i in range(min(15, len(train_generator))):
-        img, target = train_generator[i]
+    # for i in range(min(15, len(train_generator))):
+    #     img, target = train_generator[i]
         
-        print(f"\nItem {i}:")
-        print("  Image components:")
-        for j, component in enumerate(img):
-            print(f"    Component {j} shape:", component.shape)
-        for j, component in enumerate(target):  
-            print(f"    Target {j} shape:", component.shape)
+    #     print(f"\nItem {i}:")
+    #     print("  Image components:")
+    #     for j, component in enumerate(img):
+    #         print(f"    Component {j} shape:", component.shape)
+    #     for j, component in enumerate(target):  
+    #         print(f"    Target {j} shape:", component.shape)
 
     train_dataset = convert_generator_to_dataset(train_generator).repeat()
     validation_dataset = convert_generator_to_dataset(validation_generator)
@@ -192,7 +192,7 @@ def main(args = None):
                                                             num_rotation_parameter = num_rotation_parameters)},
                 loss_weights = {'regression' : 1.0,
                                 'classification': 1.0,
-                                'transformation': 0.02})
+                                'transformation': 0.1})
     
     # create the callbacks
     callbacks = create_callbacks(
@@ -264,12 +264,16 @@ def create_callbacks(training_model, prediction_model, validation_generator, arg
     if args.snapshots:
         # ensure directory created first; otherwise h5py will error after epoch.
         os.makedirs(snapshot_path, exist_ok = True)
-        checkpoint = keras.callbacks.ModelCheckpoint(os.path.join(snapshot_path, 'phi_{phi}_{dataset_type}_best_{metric}.h5'.format(phi = str(args.phi), metric = metric_to_monitor, dataset_type = args.dataset_type)),
-                                                     verbose = 1,
-                                                     save_weights_only = True,
-                                                     save_best_only = True,
-                                                     monitor = metric_to_monitor,
-                                                     mode = mode)
+        unique_filename = f'phi_{args.phi}_{args.dataset_type}_best_{metric_to_monitor}_{int(time.time())}.h5'
+        checkpoint = keras.callbacks.ModelCheckpoint(
+            os.path.join(snapshot_path, unique_filename),
+            verbose=1,
+            save_weights_only=True,
+            overwrite=True,  # Explicitly allow overwriting
+            save_best_only=True,
+            monitor=metric_to_monitor,
+            mode=mode
+        )
         callbacks.append(checkpoint)
 
     callbacks.append(keras.callbacks.ReduceLROnPlateau(

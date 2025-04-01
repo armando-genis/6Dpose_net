@@ -827,79 +827,62 @@ class SpatialAttentionModule(keras.layers.Layer):
     
 class RotationAttentionModule(keras.layers.Layer):
     """
-    Attention module specifically designed to emphasize features relevant for rotation estimation.
+    Custom attention module tailored for the rotation branch.
+    Combines channel attention (via a squeeze–excitation mechanism)
+    and spatial attention.
     """
-    def __init__(self, filters=64, kernel_size=3, **kwargs):
+    def __init__(self, reduction_ratio=16, **kwargs):
         super(RotationAttentionModule, self).__init__(**kwargs)
-        self.filters = filters
-        self.kernel_size = kernel_size
-        
+        self.reduction_ratio = reduction_ratio
+
     def build(self, input_shape):
-        # Channel attention branch
-        self.channel_avg_pool = keras.layers.GlobalAveragePooling2D()
-        self.channel_max_pool = keras.layers.GlobalMaxPooling2D()
-        
-        self.channel_shared_mlp = keras.Sequential([
-            keras.layers.Dense(input_shape[-1] // 4, activation='relu'),
-            keras.layers.Dense(input_shape[-1])
-        ])
-        
-        # Directional feature extraction
-        self.dir_conv_h = keras.layers.Conv2D(
-            self.filters, (1, self.kernel_size), padding='same', activation=None
+        channel = input_shape[-1]
+        # Channel attention: squeeze and excitation
+        self.global_avg_pool = keras.layers.GlobalAveragePooling2D(keepdims=True)
+        self.fc1 = keras.layers.Conv2D(
+            filters=max(channel // self.reduction_ratio, 1),
+            kernel_size=1,
+            activation='relu',
+            padding='same',
+            name=f'{self.name}_fc1'
         )
-        self.dir_conv_v = keras.layers.Conv2D(
-            self.filters, (self.kernel_size, 1), padding='same', activation=None
+        self.fc2 = keras.layers.Conv2D(
+            filters=channel,
+            kernel_size=1,
+            activation='sigmoid',
+            padding='same',
+            name=f'{self.name}_fc2'
         )
-        self.dir_conv_d1 = keras.layers.Conv2D(
-            self.filters, (self.kernel_size, self.kernel_size), padding='same', activation=None
+        # Spatial attention: similar to your SpatialAttentionModule
+        self.spatial_conv = keras.layers.Conv2D(
+            filters=1,
+            kernel_size=7,
+            padding='same',
+            activation='sigmoid',
+            kernel_initializer='he_normal',
+            use_bias=False,
+            name=f'{self.name}_spatial_conv'
         )
-        self.dir_conv_d2 = keras.layers.Conv2D(
-            self.filters, (self.kernel_size, self.kernel_size), padding='same', activation=None
-        )
-        
-        # Fusion layer
-        self.fusion_conv = keras.layers.Conv2D(
-            1, 1, padding='same', activation='sigmoid'
-        )
-        
         super(RotationAttentionModule, self).build(input_shape)
-        
-    def call(self, inputs, **kwargs):
+
+    def call(self, inputs):
         # Channel attention
-        avg_pool = self.channel_avg_pool(inputs)
-        max_pool = self.channel_max_pool(inputs)
-        
-        avg_channel_attention = self.channel_shared_mlp(avg_pool)
-        max_channel_attention = self.channel_shared_mlp(max_pool)
-        
-        channel_attention = keras.activations.sigmoid(avg_channel_attention + max_channel_attention)
-        channel_attention = tf.reshape(channel_attention, [-1, 1, 1, inputs.shape[-1]])
-        
-        channel_refined = inputs * channel_attention
-        
-        # Directional feature extraction (detects orientation-sensitive patterns)
-        dir_h = self.dir_conv_h(channel_refined)
-        dir_v = self.dir_conv_v(channel_refined)
-        dir_d1 = self.dir_conv_d1(channel_refined)
-        dir_d2 = self.dir_conv_d2(channel_refined)
-        
-        # Combine directional features
-        dir_combined = tf.concat([dir_h, dir_v, dir_d1, dir_d2], axis=-1)
-        dir_combined = tf.nn.relu(dir_combined)
-        
-        # Generate spatial attention map focused on rotation-relevant features
-        spatial_attention = self.fusion_conv(dir_combined)
-        
-        # Apply attention to input features
-        refined_features = inputs * spatial_attention
-        
-        return refined_features
-    
+        channel_att = self.global_avg_pool(inputs)  # shape: (batch, 1, 1, channels)
+        channel_att = self.fc1(channel_att)
+        channel_att = self.fc2(channel_att)
+        # Broadcast the channel attention to the spatial dimensions
+        channel_att = tf.broadcast_to(channel_att, tf.shape(inputs))
+        channel_refined = inputs * channel_att
+
+        # Spatial attention using average and max pooling along the channel axis
+        avg_pool = tf.reduce_mean(channel_refined, axis=-1, keepdims=True)
+        max_pool = tf.reduce_max(channel_refined, axis=-1, keepdims=True)
+        concat = tf.concat([avg_pool, max_pool], axis=-1)
+        spatial_att = self.spatial_conv(concat)
+        refined_feature = channel_refined * spatial_att
+        return refined_feature
+
     def get_config(self):
         config = super(RotationAttentionModule, self).get_config()
-        config.update({
-            'filters': self.filters,
-            'kernel_size': self.kernel_size
-        })
+        config.update({'reduction_ratio': self.reduction_ratio})
         return config
