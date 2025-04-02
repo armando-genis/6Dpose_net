@@ -775,12 +775,12 @@ class IterativeRotationSubNet(models.Model):
                                for j in range(3, 8)] for i in range(self.depth)] 
                              for k in range(self.num_iteration_steps)]
 
+        # Add rotation-specific attention modules for each conv layer and iteration step
+        self.rotation_attention = [[RotationAttentionModule(
+            name=f'{self.name}_rot_attention_{k}_{i}'
+        ) for i in range(self.depth)] for k in range(self.num_iteration_steps)]
+        
         self.activation = layers.Activation(lambda x: tf.nn.swish(x))
-
-        if self.use_group_norm:  # or use a flag for attention if desired
-            self.iter_sub_attention = RotationAttentionModule(name=f'{self.name}_iter_sub_attention')
-        else:
-            self.iter_sub_attention = None
 
     def build(self, input_shape):
         # Add empty build method to suppress warning
@@ -796,13 +796,13 @@ class IterativeRotationSubNet(models.Model):
             if 'iter_step_py' not in kwargs:
                 iter_step_py = kwargs.get('iter_step', iter_step_py)
         
-        if self.iter_sub_attention is not None:
-            feature = self.iter_sub_attention(feature)
-
         for i in range(self.depth):
             feature = self.convs[i](feature)
             feature = self.norm_layer[iter_step_py][i][level_py](feature)
             feature = self.activation(feature)
+            
+            # Apply rotation-specific attention after each conv block
+            feature = self.rotation_attention[iter_step_py][i](feature)
             
         outputs = self.head(feature)
         
@@ -872,7 +872,7 @@ class RotationNet(models.Model):
                                                 name=f'{self.name}_rotation_{i}_bn_{j}') 
                               for j in range(3, 8)] for i in range(self.depth)]
         
-        # Create the iterative subnet
+        # Create the iterative subnet with enhanced attention
         self.iterative_submodel = IterativeRotationSubNet(
             width=self.width,
             depth=self.depth - 1,
@@ -885,15 +885,24 @@ class RotationNet(models.Model):
             name="iterative_rotation_subnet"
         )
         
-        # Create a dedicated rotation attention module
+        # Create rotation-specific attention modules for main network
         if self.use_attention:
-            self.rotation_attention_module = RotationAttentionModule(name=f'{self.name}_rotation_attention')
-            self.iter_rotation_attention_modules = []
-            # Create one attention module per iteration step (adjust the number as needed)
-            for i in range(5):  # Assuming 5 levels, as in the original design
-                for j in range(self.num_iteration_steps):
-                    self.iter_rotation_attention_modules.append(
-                        RotationAttentionModule(name=f'{self.name}_iter_rotation_attention_{i}_{j}')
+            # Enhanced attention for each conv layer
+            self.rotation_attention = [RotationAttentionModule(
+                name=f'{self.name}_rotation_attention_{i}'
+            ) for i in range(self.depth)]
+            
+            # Level-specific enhanced attention
+            self.level_attention = [RotationAttentionModule(
+                name=f'{self.name}_level_attention_{i}'
+            ) for i in range(5)]  # Assuming 5 levels max in FPN
+            
+            # Enhanced attention for iterative steps
+            self.iter_attention = []
+            for i in range(5):  # For each level
+                for j in range(self.num_iteration_steps):  # For each iteration step
+                    self.iter_attention.append(
+                        RotationAttentionModule(name=f'{self.name}_iter_attention_{i}_{j}')
                     )
 
         self.activation = layers.Activation(lambda x: tf.nn.swish(x))
@@ -917,10 +926,14 @@ class RotationNet(models.Model):
             feature = self.norm_layer[i][level](feature)
             feature = self.activation(feature)
             
-        # Add spatial attention before initial rotation prediction
+            # Apply rotation-specific attention after each conv block
+            if self.use_attention:
+                feature = self.rotation_attention[i](feature)
+        
+        # Apply level-specific attention
         if self.use_attention:
-            attended_feature = self.rotation_attention_module(feature)
-            rotation = self.initial_rotation(attended_feature)
+            feature = self.level_attention[level](feature)
+            rotation = self.initial_rotation(feature)
         else:
             rotation = self.initial_rotation(feature)
         
@@ -936,10 +949,10 @@ class RotationNet(models.Model):
         for i in range(self.num_iteration_steps):
             iterative_input = self.concat([feature, rotation_reshaped])
 
-            # Optionally apply attention to iterative input
+            # Apply enhanced attention to iterative input
             if self.use_attention:
                 iter_attention_idx = level * self.num_iteration_steps + i
-                iterative_input = self.iter_rotation_attention_modules[iter_attention_idx](iterative_input)
+                iterative_input = self.iter_attention[iter_attention_idx](iterative_input)
 
             # Call iterative submodel
             delta_rotation = self.iterative_submodel(

@@ -27,3 +27,6 @@ pip install tqdm
 
 
 python3 train.py --phi 0 --weights /workspace/network_tensortflow/attention_checpoint.h5 --epochs 600 --gpu 0 --validation-image-save-path /workspace/eval_images/ linemod /workspace/dataset-custom-v10-ladle-big/ --object-id 1
+
+
+python3 train.py --phi 0 --weights imagenet --epochs 600 --gpu 0 --validation-image-save-path /workspace/eval_images/ linemod /workspace/dataset-custom-v10-ladle-big/ --object-id 1

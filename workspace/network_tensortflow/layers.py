@@ -827,62 +827,108 @@ class SpatialAttentionModule(keras.layers.Layer):
     
 class RotationAttentionModule(keras.layers.Layer):
     """
-    Custom attention module tailored for the rotation branch.
-    Combines channel attention (via a squeeze–excitation mechanism)
-    and spatial attention.
+    Specialized attention mechanism for rotation-specific features.
+    Combines channel attention and spatial attention to focus on
+    features most relevant to rotation prediction.
     """
-    def __init__(self, reduction_ratio=16, **kwargs):
+    def __init__(self, reduction_ratio=8, **kwargs):
         super(RotationAttentionModule, self).__init__(**kwargs)
         self.reduction_ratio = reduction_ratio
-
+        
     def build(self, input_shape):
-        channel = input_shape[-1]
-        # Channel attention: squeeze and excitation
+        channels = input_shape[-1]
+        reduced_channels = max(1, channels // self.reduction_ratio)
+        
+        # Channel attention components
         self.global_avg_pool = keras.layers.GlobalAveragePooling2D(keepdims=True)
-        self.fc1 = keras.layers.Conv2D(
-            filters=max(channel // self.reduction_ratio, 1),
-            kernel_size=1,
-            activation='relu',
-            padding='same',
-            name=f'{self.name}_fc1'
+        self.global_max_pool = keras.layers.GlobalMaxPooling2D(keepdims=True)
+        
+        # Two-layer MLP for channel attention
+        self.channel_down = keras.layers.Conv2D(
+            reduced_channels, 
+            kernel_size=1, 
+            padding='same', 
+            activation=tf.nn.swish,
+            name=f'{self.name}_channel_down'
         )
-        self.fc2 = keras.layers.Conv2D(
-            filters=channel,
-            kernel_size=1,
+        self.channel_up = keras.layers.Conv2D(
+            channels, 
+            kernel_size=1, 
+            padding='same', 
             activation='sigmoid',
-            padding='same',
-            name=f'{self.name}_fc2'
+            name=f'{self.name}_channel_up'
         )
-        # Spatial attention: similar to your SpatialAttentionModule
-        self.spatial_conv = keras.layers.Conv2D(
-            filters=1,
-            kernel_size=7,
-            padding='same',
-            activation='sigmoid',
-            kernel_initializer='he_normal',
-            use_bias=False,
-            name=f'{self.name}_spatial_conv'
-        )
+        
+        # Spatial attention module
+        self.spatial_attention = SpatialAttentionModule(name=f'{self.name}_spatial')
+        
         super(RotationAttentionModule, self).build(input_shape)
-
-    def call(self, inputs):
-        # Channel attention
-        channel_att = self.global_avg_pool(inputs)  # shape: (batch, 1, 1, channels)
-        channel_att = self.fc1(channel_att)
-        channel_att = self.fc2(channel_att)
-        # Broadcast the channel attention to the spatial dimensions
-        channel_att = tf.broadcast_to(channel_att, tf.shape(inputs))
-        channel_refined = inputs * channel_att
-
-        # Spatial attention using average and max pooling along the channel axis
-        avg_pool = tf.reduce_mean(channel_refined, axis=-1, keepdims=True)
-        max_pool = tf.reduce_max(channel_refined, axis=-1, keepdims=True)
-        concat = tf.concat([avg_pool, max_pool], axis=-1)
-        spatial_att = self.spatial_conv(concat)
-        refined_feature = channel_refined * spatial_att
-        return refined_feature
-
+        
+    def build(self, input_shape):
+        channels = input_shape[-1]
+        reduced_channels = max(1, channels // self.reduction_ratio)
+        
+        # Channel attention components
+        self.global_avg_pool = keras.layers.GlobalAveragePooling2D(keepdims=True)
+        self.global_max_pool = keras.layers.GlobalMaxPooling2D(keepdims=True)
+        
+        # Two-layer MLP for channel attention
+        self.channel_down = keras.layers.Conv2D(
+            reduced_channels, 
+            kernel_size=1, 
+            padding='same', 
+            activation=tf.nn.swish,
+            name=f'{self.name}_channel_down'
+        )
+        self.channel_up = keras.layers.Conv2D(
+            channels, 
+            kernel_size=1, 
+            padding='same', 
+            activation='sigmoid',
+            name=f'{self.name}_channel_up'
+        )
+        
+        # Spatial attention module
+        self.spatial_attention = SpatialAttentionModule(name=f'{self.name}_spatial')
+        
+        # Learnable scale parameter for residual connection
+        self.attention_scale = self.add_weight(
+            name=f'{self.name}_attention_scale',
+            shape=(1,),
+            initializer=keras.initializers.Constant(0.5),
+            trainable=True,
+            dtype=tf.float32
+        )
+        
+        super(RotationAttentionModule, self).build(input_shape)
+        
+    def call(self, inputs, **kwargs):
+        # Channel attention path
+        avg_pool = self.global_avg_pool(inputs)
+        max_pool = self.global_max_pool(inputs)
+        
+        avg_channel = self.channel_down(avg_pool)
+        avg_channel = self.channel_up(avg_channel)
+        
+        max_channel = self.channel_down(max_pool)
+        max_channel = self.channel_up(max_channel)
+        
+        # Combine channel attentions
+        channel_attention = avg_channel + max_channel
+        
+        # Apply channel attention
+        channel_refined = inputs * channel_attention
+        
+        # Apply spatial attention
+        spatial_refined = self.spatial_attention(channel_refined)
+        
+        # Residual connection with learnable scale
+        # This allows the network to learn how much of the attention to apply
+        return inputs + self.attention_scale * spatial_refined
+    
     def get_config(self):
         config = super(RotationAttentionModule, self).get_config()
-        config.update({'reduction_ratio': self.reduction_ratio})
+        config.update({
+            'reduction_ratio': self.reduction_ratio
+        })
         return config

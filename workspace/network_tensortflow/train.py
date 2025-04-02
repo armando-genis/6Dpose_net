@@ -192,7 +192,7 @@ def main(args = None):
                                                             num_rotation_parameter = num_rotation_parameters)},
                 loss_weights = {'regression' : 1.0,
                                 'classification': 1.0,
-                                'transformation': 0.1})
+                                'transformation': 0.02})
     
     # create the callbacks
     callbacks = create_callbacks(
@@ -264,16 +264,12 @@ def create_callbacks(training_model, prediction_model, validation_generator, arg
     if args.snapshots:
         # ensure directory created first; otherwise h5py will error after epoch.
         os.makedirs(snapshot_path, exist_ok = True)
-        unique_filename = f'phi_{args.phi}_{args.dataset_type}_best_{metric_to_monitor}_{int(time.time())}.h5'
-        checkpoint = keras.callbacks.ModelCheckpoint(
-            os.path.join(snapshot_path, unique_filename),
-            verbose=1,
-            save_weights_only=True,
-            overwrite=True,  # Explicitly allow overwriting
-            save_best_only=True,
-            monitor=metric_to_monitor,
-            mode=mode
-        )
+        checkpoint = keras.callbacks.ModelCheckpoint(os.path.join(snapshot_path, 'phi_{phi}_{dataset_type}_best_{metric}.h5'.format(phi = str(args.phi), metric = metric_to_monitor, dataset_type = args.dataset_type)),
+                                                     verbose = 1,
+                                                     save_weights_only = True,
+                                                     save_best_only = True,
+                                                     monitor = metric_to_monitor,
+                                                     mode = mode)
         callbacks.append(checkpoint)
 
     callbacks.append(keras.callbacks.ReduceLROnPlateau(
