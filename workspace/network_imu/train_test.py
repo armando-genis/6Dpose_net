@@ -365,12 +365,9 @@ def validate_model(model, val_generator, focal_loss, smooth_l1_loss, trans_loss,
                 else:
                     print(f"No detections found for image {i}")
                 
-                # Ensure directory exists
-                os.makedirs(save_path, exist_ok=True)
-                
-                # Save the visualization
                 img_save_path = os.path.join(save_path, f'epoch_{epoch}_img_{i}.jpg')
                 cv2.imwrite(img_save_path, vis_image)
+
                 
             except Exception as e:
                 print(f"Error saving visualization for image {i}: {str(e)}")

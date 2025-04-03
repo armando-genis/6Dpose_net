@@ -14,7 +14,8 @@ from custom_load_weights import custom_load_weights
 # models
 # from model import build_EfficientPose
 # from modeltest import build_EfficientPose
-from modelrotation import build_EfficientPose
+# from modelrotation import build_EfficientPose
+from model_transformers import build_EfficientPose
 
 from losses import smooth_l1, focal, transformation_loss
 from eval.eval_callback import Evaluate
@@ -88,7 +89,7 @@ def parse_args(args):
     parser.add_argument('--phi', help = 'Hyper parameter phi', default = 0, type = int, choices = (0, 1, 2, 3, 4, 5, 6))
     parser.add_argument('--gpu', help = 'Id of the GPU to use (as reported by nvidia-smi).')
     parser.add_argument('--epochs', help = 'Number of epochs to train.', type = int, default = 500)
-    parser.add_argument('--steps', help = 'Number of steps per epoch.', type = int, default = int(179 * 10))
+    parser.add_argument('--steps', help = 'Number of steps per epoch.', type = int, default = int(200 * 10))
     parser.add_argument('--snapshot-path', help = 'Path to store snapshots of models during training', default = os.path.join("checkpoints", date_and_time))
     parser.add_argument('--tensorboard-dir', help = 'Log directory for Tensorboard output', default = os.path.join("logs", date_and_time))
     parser.add_argument('--no-snapshots', help = 'Disable saving snapshots.', dest = 'snapshots', action = 'store_false')
@@ -264,7 +265,7 @@ def create_callbacks(training_model, prediction_model, validation_generator, arg
     if args.snapshots:
         # ensure directory created first; otherwise h5py will error after epoch.
         os.makedirs(snapshot_path, exist_ok = True)
-        checkpoint = keras.callbacks.ModelCheckpoint(os.path.join(snapshot_path, 'phi_{phi}_{dataset_type}_best_{metric}.h5'.format(phi = str(args.phi), metric = metric_to_monitor, dataset_type = args.dataset_type)),
+        checkpoint = keras.callbacks.ModelCheckpoint(os.path.join(snapshot_path, 'vt_att_phi_{phi}_{dataset_type}_best_{metric}.h5'.format(phi = str(args.phi), metric = metric_to_monitor, dataset_type = args.dataset_type)),
                                                      verbose = 1,
                                                      save_weights_only = True,
                                                      save_best_only = True,

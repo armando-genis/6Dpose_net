@@ -1213,6 +1213,88 @@ class TranslationNet(models.Model):
             self.level += 1
             
         return outputs
+    
+
+
+class TransformerBlock(keras.layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1, **kwargs):
+        super(TransformerBlock, self).__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.dropout = dropout
+        
+    def build(self, input_shape):
+        self.att = keras.layers.MultiHeadAttention(
+            num_heads=self.num_heads, key_dim=self.embed_dim//self.num_heads
+        )
+        self.ffn = keras.Sequential([
+            keras.layers.Dense(self.ff_dim, activation=tf.nn.gelu),
+            keras.layers.Dense(self.embed_dim)
+        ])
+        self.layernorm1 = keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = keras.layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = keras.layers.Dropout(self.dropout)
+        self.dropout2 = keras.layers.Dropout(self.dropout)
+        
+        super(TransformerBlock, self).build(input_shape)
+        
+    def call(self, inputs, training=True):
+        # Reshape spatial dimensions to sequence
+        batch_size, height, width, channels = tf.shape(inputs)[0], tf.shape(inputs)[1], tf.shape(inputs)[2], tf.shape(inputs)[3]
+        x = tf.reshape(inputs, [batch_size, height * width, channels])
+        
+        # Apply self-attention
+        attn_output = self.att(x, x)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(x + attn_output)
+        
+        # Apply feed-forward network
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        out2 = self.layernorm2(out1 + ffn_output)
+        
+        # Reshape back to spatial dimensions
+        out2 = tf.reshape(out2, [batch_size, height, width, channels])
+        
+        return out2
+
+
+def add_transformer_to_fpn(fpn_features, embed_dim=256, num_heads=8, ff_dim=1024, num_transformer_layers=2):
+    """
+    Enhance FPN features with transformer blocks
+    
+    Args:
+        fpn_features: List of feature maps from BiFPN
+        embed_dim: Embedding dimension for transformer
+        num_heads: Number of attention heads
+        ff_dim: Feed-forward network dimension
+        num_transformer_layers: Number of transformer layers to stack
+        
+    Returns:
+        Enhanced feature maps
+    """
+    enhanced_features = []
+    
+    for i, feature in enumerate(fpn_features):
+        # Adjust channel dimension to match embed_dim if needed
+        if feature.shape[-1] != embed_dim:
+            feature = keras.layers.Conv2D(embed_dim, kernel_size=1, padding='same')(feature)
+        
+        # Apply stack of transformer blocks
+        x = feature
+        for j in range(num_transformer_layers):
+            x = TransformerBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                name=f'transformer_level_{i}_layer_{j}'
+            )(x)
+        
+        enhanced_features.append(x)
+    
+    return enhanced_features
+
 
 
 if __name__ == '__main__':

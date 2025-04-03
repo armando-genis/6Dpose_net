@@ -1440,7 +1440,7 @@ def apply_subnets_to_feature_maps(box_net, class_net, rotation_net, translation_
         classification.append(class_net(feature, i))
     classification = torch.cat(classification, dim=1)
 
-    print(f"Classification shape: {classification.shape}")
+    # print(f"Classification shape: {classification.shape}")
     
     # Apply box network to feature maps and concatenate results
     bbox_regression = []
@@ -1448,7 +1448,7 @@ def apply_subnets_to_feature_maps(box_net, class_net, rotation_net, translation_
         bbox_regression.append(box_net(feature, i))
     bbox_regression = torch.cat(bbox_regression, dim=1)
 
-    print(f"Bbox regression shape: {bbox_regression.shape}")
+    # print(f"Bbox regression shape: {bbox_regression.shape}")
     
     # Apply rotation network to feature maps and concatenate results
     rotation = []
@@ -1457,7 +1457,7 @@ def apply_subnets_to_feature_maps(box_net, class_net, rotation_net, translation_
     rotation = torch.cat(rotation, dim=1)
     
 
-    print(f"Rotation shape: {rotation.shape}")
+    # print(f"Rotation shape: {rotation.shape}")
 
     # Apply translation network to feature maps and concatenate results
     translation_raw = []
@@ -1465,7 +1465,7 @@ def apply_subnets_to_feature_maps(box_net, class_net, rotation_net, translation_
         translation_raw.append(translation_net([feature, i]))
     translation_raw = torch.cat(translation_raw, dim=1)
 
-    print(f"Translation raw shape: {translation_raw.shape}")
+    # print(f"Translation raw shape: {translation_raw.shape}")
 
     anchors, translation_anchors = anchors_for_shape((input_size, input_size), anchor_params=anchor_parameters)
     
@@ -1474,14 +1474,14 @@ def apply_subnets_to_feature_maps(box_net, class_net, rotation_net, translation_
     translation_anchors = translation_anchors.to(device)
     translation_anchors_input = translation_anchors.unsqueeze(0)  # Now on the same device
 
-    print(f"Anchors shape: {anchors.shape}")
-    print(f"Translation anchors shape: {translation_anchors_input.shape}")
+    # print(f"Anchors shape: {anchors.shape}")
+    # print(f"Translation anchors shape: {translation_anchors_input.shape}")
 
     # Apply regression to translation anchors
     regress_translation = RegressTranslation()
     translation_xy_Tz = regress_translation([translation_anchors_input, translation_raw])
 
-    print(f"Translation xy Tz shape: {translation_xy_Tz.shape}")
+    # print(f"Translation xy Tz shape: {translation_xy_Tz.shape}")
 
     calculate_txty = CalculateTxTy()
     translation = calculate_txty(
